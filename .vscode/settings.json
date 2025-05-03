@@ -1,0 +1,24 @@
+{
+    "files.associations": {
+        "*.cpp": "cpp",
+        "ostream": "cpp",
+        "array": "cpp",
+        "chrono": "cpp",
+        "deque": "cpp",
+        "format": "cpp",
+        "forward_list": "cpp",
+        "initializer_list": "cpp",
+        "list": "cpp",
+        "span": "cpp",
+        "vector": "cpp",
+        "xhash": "cpp",
+        "xstring": "cpp",
+        "xtree": "cpp",
+        "xutility": "cpp",
+        "ctime": "cpp",
+        "cwchar": "cpp",
+        "system_error": "cpp",
+        "variant": "cpp",
+        "mutex": "cpp"
+    }
+}
