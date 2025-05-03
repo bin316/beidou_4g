@@ -7,10 +7,44 @@
 
 #include <Xuart.h>
 
-#include "map"
 #include "errno.h"
 
-static std::map<UART_HandleTypeDef*, Xuart*> uart_map;
+#define MAX_UART_NUM 4
+struct UartMapEntry {
+    UART_HandleTypeDef* handle;
+    Xuart* instance;
+};
+static UartMapEntry uart_map_array[MAX_UART_NUM] = {0};
+
+static Xuart* find_uart_instance(UART_HandleTypeDef* handle) {
+    for (int i = 0; i < MAX_UART_NUM; ++i) {
+        if (uart_map_array[i].handle == handle) {
+            return uart_map_array[i].instance;
+        }
+    }
+    return nullptr;
+}
+
+static bool add_uart_instance(UART_HandleTypeDef* handle, Xuart* instance) {
+    for (int i = 0; i < MAX_UART_NUM; ++i) {
+        if (uart_map_array[i].handle == nullptr) {
+            uart_map_array[i].handle = handle;
+            uart_map_array[i].instance = instance;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void remove_uart_instance(UART_HandleTypeDef* handle) {
+    for (int i = 0; i < MAX_UART_NUM; ++i) {
+        if (uart_map_array[i].handle == handle) {
+            uart_map_array[i].handle = nullptr;
+            uart_map_array[i].instance = nullptr;
+            return;
+        }
+    }
+}
 
 Xuart::Xuart(UART_HandleTypeDef *huart, size_t tx_buffer_size,
 		size_t rx_buffer_size, size_t tx_dma_size, size_t rx_dma_size) {
@@ -27,55 +61,58 @@ Xuart::~Xuart() {
 }
 
 bool Xuart::isOpened(Xuart *instance) {
-	if (uart_map.find(instance->phuart) != uart_map.end()) {
-		return true;
-	}
-	return false;
+    if (find_uart_instance(instance->phuart) != nullptr) {
+        return true;
+    }
+    return false;
 }
 
 int Xuart::open(void) {
-	/*do not open twice*/
-	if (isOpened(this)) {
-		return EBUSY;
-	}
-	/*try to allocate resources*/
-	int allocate_result = allocate_resources();
-	if (allocate_result != 0) {
-		return allocate_result;
-	}
-	/*add the opened uart to the map*/
-	uart_map[phuart] = this;
-	/*register callbacks*/
-	HAL_UART_RegisterCallback(phuart, HAL_UART_ERROR_CB_ID, isr_uart_error);
-	HAL_UART_RegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID,
-			isr_uart_tx_complete);
-	HAL_UART_RegisterRxEventCallback(phuart, isr_uart_rti);
-	/*start receive*/
-	HAL_UARTEx_ReceiveToIdle_DMA(phuart, this->rx_dma_buffer,
-			this->rx_dma_size);
-	/*success*/
-	return 0;
+    /*do not open twice*/
+    if (isOpened(this)) {
+        return EBUSY;
+    }
+    /*try to allocate resources*/
+    int allocate_result = allocate_resources();
+    if (allocate_result != 0) {
+        return allocate_result;
+    }
+    /*add the opened uart to the array*/
+    if (!add_uart_instance(phuart, this)) {
+        release_resources();
+        return ENOMEM;
+    }
+    /*register callbacks*/
+    HAL_UART_RegisterCallback(phuart, HAL_UART_ERROR_CB_ID, isr_uart_error);
+    HAL_UART_RegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID,
+            isr_uart_tx_complete);
+    HAL_UART_RegisterRxEventCallback(phuart, isr_uart_rti);
+    /*start receive*/
+    HAL_UARTEx_ReceiveToIdle_DMA(phuart, this->rx_dma_buffer,
+            this->rx_dma_size);
+    /*success*/
+    return 0;
 }
 
 int Xuart::close(void) {
-
-	/*do not close twice*/
-	if (!isOpened(this)) {
-		return EBUSY;
-	}
-	/*disable usart intterrupt*/
-	HAL_UART_Abort(phuart);
-	/*unregister all callbacks*/
-	HAL_UART_UnRegisterRxEventCallback(phuart);
-	HAL_UART_UnRegisterCallback(phuart, HAL_UART_ERROR_CB_ID);
-	HAL_UART_UnRegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID);
-	/*free all resources*/
-	release_resources();
-	/*remove item from map*/
-	uart_map.erase(phuart);
-	/*success*/
-	return 0;
+    /*do not close twice*/
+    if (!isOpened(this)) {
+        return EBUSY;
+    }
+    /*disable usart intterrupt*/
+    HAL_UART_Abort(phuart);
+    /*unregister all callbacks*/
+    HAL_UART_UnRegisterRxEventCallback(phuart);
+    HAL_UART_UnRegisterCallback(phuart, HAL_UART_ERROR_CB_ID);
+    HAL_UART_UnRegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID);
+    /*free all resources*/
+    release_resources();
+    /*remove item from array*/
+    remove_uart_instance(phuart);
+    /*success*/
+    return 0;
 }
+
 int Xuart::read(void *data, size_t size, uint32_t timeout) {
 	/*open check*/
 	if (!isOpened(this)) {
@@ -194,37 +231,40 @@ int Xuart::ioctl(int cmd, void *arg) {
 }
 
 void Xuart::isr_uart_rti(UART_HandleTypeDef *uart, uint16_t pos) {
-	/*$todo this is a stub function*/
-	BaseType_t mustYield = false;
-	/*check if the uart is opened*/
-	if (uart_map.find(uart) != uart_map.end()) {
-		/*continue receive*/
-		HAL_UARTEx_ReceiveToIdle_DMA(uart, uart_map[uart]->rx_dma_buffer,
-				uart_map[uart]->rx_dma_size);
-		Xuart *pthis = uart_map[uart];
-		/*get the size of the data in the buffer*/
-		size_t size = xStreamBufferSpacesAvailable(pthis->rx_stream_buffer);
-		/*if the free space is not capable for holding all received data, ignore the content that exceeds the size of buffer*/
-		if (size > pos)
-			/*space is enough*/
-			size = pos;
-		if (size > 0) {
-			xStreamBufferSendFromISR(pthis->rx_stream_buffer,
-					pthis->rx_dma_buffer, size, &mustYield);
-			portYIELD_FROM_ISR(mustYield);
-		}
-	}
+    /*$todo this is a stub function*/
+    BaseType_t mustYield = false;
+    /*check if the uart is opened*/
+    Xuart *pthis = find_uart_instance(uart);
+    if (pthis != nullptr) {
+        /*continue receive*/
+        HAL_UARTEx_ReceiveToIdle_DMA(uart, pthis->rx_dma_buffer,
+                pthis->rx_dma_size);
+        /*get the size of the data in the buffer*/
+        size_t size = xStreamBufferSpacesAvailable(pthis->rx_stream_buffer);
+        /*if the free space is not capable for holding all received data, ignore the content that exceeds the size of buffer*/
+        if (size > pos)
+            /*space is enough*/
+            size = pos;
+        if (size > 0) {
+            xStreamBufferSendFromISR(pthis->rx_stream_buffer,
+                    pthis->rx_dma_buffer, size, &mustYield);
+            portYIELD_FROM_ISR(mustYield);
+        }
+    }
 }
 
 void Xuart::isr_uart_error(UART_HandleTypeDef *uart) {
-	__HAL_UNLOCK(uart);
-	__HAL_UART_CLEAR_IDLEFLAG(uart);
-	__HAL_UART_CLEAR_PEFLAG(uart);
-	__HAL_UART_CLEAR_FEFLAG(uart);
-	__HAL_UART_CLEAR_NEFLAG(uart);
-	__HAL_UART_CLEAR_OREFLAG(uart);
-	HAL_UARTEx_ReceiveToIdle_DMA(uart, uart_map[uart]->rx_dma_buffer,
-			uart_map[uart]->rx_dma_size);
+    __HAL_UNLOCK(uart);
+    __HAL_UART_CLEAR_IDLEFLAG(uart);
+    __HAL_UART_CLEAR_PEFLAG(uart);
+    __HAL_UART_CLEAR_FEFLAG(uart);
+    __HAL_UART_CLEAR_NEFLAG(uart);
+    __HAL_UART_CLEAR_OREFLAG(uart);
+    Xuart *pthis = find_uart_instance(uart);
+    if (pthis != nullptr) {
+        HAL_UARTEx_ReceiveToIdle_DMA(uart, pthis->rx_dma_buffer,
+                pthis->rx_dma_size);
+    }
 }
 
 int Xuart::print(const char *fmt, ...) {
@@ -274,8 +314,8 @@ int Xuart::print(const char *fmt, va_list args) {
 
 void Xuart::isr_uart_tx_complete(UART_HandleTypeDef *uart) {
     BaseType_t mustYield = false;
-    if (uart_map.find(uart) != uart_map.end()) {
-        Xuart *pthis = uart_map[uart];
+    Xuart *pthis = find_uart_instance(uart);
+    if (pthis != nullptr) {
         size_t size = xStreamBufferBytesAvailable(pthis->tx_stream_buffer);
         if (size > 0) {
             size = size > pthis->tx_dma_size ? pthis->tx_dma_size : size;
