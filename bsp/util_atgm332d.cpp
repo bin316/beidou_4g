@@ -60,16 +60,16 @@ static void atgm332d_UpdateLocalTime(void) {
 
 static void atgm332d_rx_thread(void *argument) {
 	NMEA0183 parser;
-	char *buffer = (char*) pvPortMalloc(1000);
-	parser.setMessageField(buffer, 1000);
+	char *buffer = (char*) pvPortMalloc(1500);
+	parser.setMessageField(buffer, 1500);
 
 	auto clear = [&buffer]() {
-		memset(buffer, 0, 1000);
+		memset(buffer, 0, 1500);
 	};
 	loop:
 
 	clear();
-	if (uart->read(buffer, 1000, 100) <= 0)
+	if (uart->read(buffer, 1500, 100) <= 0)
 		goto loop;
 
 	if (parser.parseRmcMessage() != false) {
@@ -108,8 +108,8 @@ static void atgm332d_rx_thread(void *argument) {
 }
 
 void __util_atgm332d_init__(void) {
-//	uart = new BufferedUart(&huart2, 32, 1200, 32, 1200);
-//	configASSERT(uart != nullptr);
+	uart = new BufferedUart(&huart2, 32, 1500, 32, 1500);
+	configASSERT(uart != nullptr);
 
 	nvm_atgm332d = new NVM(NVM::partition_bd, (void*) &status,
 			(void*) &default_status, sizeof(util_atgm332d_status_t));
@@ -117,10 +117,10 @@ void __util_atgm332d_init__(void) {
 
 	util_atgm332d_load();
 
-//	xTaskCreate(atgm332d_rx_thread, "atgm332d rx", 512, NULL, osPriorityHigh,
-//			&rxTaskHandle);
-//	configASSERT(rxTaskHandle != NULL);
-//	logInfo("bd positioning daemon thread started..");
+	xTaskCreate(atgm332d_rx_thread, "atgm332d rx", 512, NULL, osPriorityHigh,
+			&rxTaskHandle);
+	configASSERT(rxTaskHandle != NULL);
+	logInfo("bd positioning daemon thread started..");
 }
 
 /*

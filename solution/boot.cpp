@@ -64,7 +64,7 @@ extern "C" void boot_thread(void *argument) {
 	 */
 
 //	__HAL_DBGMCU_FREEZE_IWDG();
-	__util_shell_init__();
+//	__util_shell_init__();
 	__util_events_init__();	//初始化事件队列
 	__util_lowpower_init__();	//初始化低功耗
 
