@@ -126,7 +126,7 @@ void __util_lowpower_init__(void) {
 		return;
 	}
 	if (rt_lowpower_config.wake_pin_enable
-			&& wake_source != util_lowpower_wake_source_e::pin) {
+			&& wake_source == util_lowpower_wake_source_e::pin) {
 		/*如果唤醒源不是rtc
 		 * 1.长期休眠可能被打断
 		 * 2.正常上电启动，无需休眠
