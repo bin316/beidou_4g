@@ -1,0 +1,43 @@
+---
+# 基于 Microsoft 风格
+BasedOnStyle: Microsoft
+
+# 缩进
+IndentWidth: 4
+UseTab: Never
+IndentCaseLabels: true
+AccessModifierOffset: -4
+ContinuationIndentWidth: 4
+
+# 不自动排序#include 语句
+SortIncludes: false
+
+# 开启行末注释对齐
+AlignTrailingComments:
+    Kind: Always
+    OverEmptyLines: 1  # 允许间隔一个空行
+
+# 枚举类型不允许单行
+AllowShortEnumsOnASingleLine: false
+
+# 大括号风格
+BreakBeforeBraces: Attach
+
+AlignAfterOpenBracket: DontAlign
+AlignOperands: Align
+
+# 允许将初始化列表的大括号换行
+Cpp11BracedListStyle: false
+
+# 每行最大字符数
+ColumnLimit: 100
+
+# 允许的最大连续空行
+MaxEmptyLinesToKeep: 1
+
+# 代码块间添加空行
+SeparateDefinitionBlocks: Always
+
+# 代码块开头不允许留空行
+# KeepEmptyLinesAtTheStartOfBlocks: false
+---

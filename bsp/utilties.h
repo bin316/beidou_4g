@@ -389,6 +389,13 @@ void util_analog_set_config(util_analog_config_s config);
  */
 util_analog_config_s util_analog_get_config(void);
 
+/*
+ * suspending and resuming analog utilities
+ * */
+void util_analog_suspend(void);
+void util_analog_resume(void);
+
+
 void __util_shell_init__(void);
 
 typedef struct {

@@ -38,7 +38,7 @@
 /*出厂默认阈值低电压*/
 #define PROD_CONFIG_FACTORY_VBAT_LOW    30
 /*出厂默认定位搜索倒计时*/
-#define PROD_CONFIG_FACTORY_GNSS_SEARCH_TIMEOUT    60
+#define PROD_CONFIG_FACTORY_GNSS_SEARCH_TIMEOUT    100
 /*出厂默认定位搜索完成倒计时*/
 #define PROD_CONFIG_FACTORY_GNSS_SEARCH_COMPLETE_TIMEOUT    15
 /*出厂默认网络良好唤醒倒计时(分钟)*/

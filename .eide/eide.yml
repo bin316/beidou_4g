@@ -1,0 +1,197 @@
+version: "4.1"
+name: bd_4g
+type: ARM
+deviceName: null
+packDir: null
+srcDirs:
+  - lowlevel
+  - solution
+  - bsp
+  - lettershell
+  - templates
+  - Core
+  - Middlewares
+  - utilties
+  - Drivers
+  - USB_DEVICE
+virtualFolder:
+  name: <virtual_root>
+  files: []
+  folders: []
+dependenceList: []
+outDir: build
+miscInfo:
+  uid: 828c37209fc6647f7f01746b54aa71ea
+targets:
+  Debug:
+    cppPreprocessAttrs:
+      defineList:
+        - DEBUG
+        - USE_HAL_DRIVER
+        - STM32L432xx
+      incList:
+        - Core/Inc
+        - Drivers/STM32L4xx_HAL_Driver/Inc
+        - Drivers/STM32L4xx_HAL_Driver/Inc/Legacy
+        - Middlewares/Third_Party/FreeRTOS/Source/include
+        - Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+        - Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F
+        - Drivers/CMSIS/Device/ST/STM32L4xx/Include
+        - Drivers/CMSIS/Include
+        - solution
+        - bsp
+        - magic_enum
+        - templates
+        - lowlevel
+        - utilties
+        - fmt
+        - fmt/include
+        - lettershell
+        - USB_DEVICE/App
+        - USB_DEVICE/Target
+        - Middlewares/ST/STM32_USB_Device_Library/Core/Inc
+        - Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
+        - Middlewares/ST/ARM/DSP/Inc
+      libList:
+        - Middlewares/ST/ARM/DSP/Lib
+    excludeList:
+      - util_air780.cpp
+      - bsp/util_air780.cpp
+    toolchain: GCC
+    toolchainConfigMap:
+      GCC:
+        archExtensions: ""
+        cpuType: Cortex-M4
+        floatingPointHardware: single
+        options:
+          version: 5
+          afterBuildTasks: []
+          asm-compiler:
+            ASM_FLAGS: -DDEBUG
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            C_FLAGS: -mslow-flash-data
+            language-c: gnu11
+            language-cpp: gnu++17
+            one-elf-section-per-data: true
+            one-elf-section-per-function: true
+            optimization: level-debug
+            warnings: all-warnings
+          global:
+            $float-abi-type: hard
+            arm-thumb-mode: thumb
+            misc-control: -u _printf_float -u _scanf_float
+            not-use-syscalls: true
+            output-debug-info: enable
+            use-newlib-nano: true
+          linker:
+            $outputTaskExcludes:
+              - .bin
+            $toolName: auto
+            LIB_FLAGS: -l:libarm_cortexM4lf_math.a
+            output-format: elf
+            remove-unused-input-sections: true
+        scatterFilePath: STM32L432KCUX_FLASH.ld
+        storageLayout:
+          RAM: []
+          ROM: []
+        useCustomScatterFile: true
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: STM32L432KC
+          vendor: ST
+        otherCmds: ""
+        proType: 1
+        speed: 8000
+      OpenOCD:
+        baseAddr: "0x08000000"
+        bin: ""
+        interface: cmsis-dap
+        target: stm32l4x
+    uploader: OpenOCD
+  Release:
+    cppPreprocessAttrs:
+      defineList:
+        - USE_HAL_DRIVER
+        - STM32L432xx
+      incList:
+        - Core/Inc
+        - Drivers/STM32L4xx_HAL_Driver/Inc
+        - Drivers/STM32L4xx_HAL_Driver/Inc/Legacy
+        - Middlewares/Third_Party/FreeRTOS/Source/include
+        - Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+        - Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F
+        - Drivers/CMSIS/Device/ST/STM32L4xx/Include
+        - Drivers/CMSIS/Include
+        - solution
+        - bsp
+        - magic_enum
+        - templates
+        - lowlevel
+        - utilties
+        - fmt/include/fmt
+        - fmt/include
+        - fmt
+        - lettershell
+        - USB_DEVICE/App
+        - USB_DEVICE/Target
+        - Middlewares/ST/STM32_USB_Device_Library/Core/Inc
+        - Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
+        - Middlewares/ST/ARM/DSP/Inc
+      libList:
+        - Middlewares/ST/ARM/DSP/Lib
+    excludeList:
+      - util_air780.cpp
+    toolchain: GCC
+    toolchainConfigMap:
+      GCC:
+        archExtensions: ""
+        cpuType: Cortex-M4
+        floatingPointHardware: single
+        options:
+          version: 5
+          afterBuildTasks: []
+          asm-compiler:
+            ASM_FLAGS: ""
+          beforeBuildTasks: []
+          c/cpp-compiler:
+            CXX_FLAGS: ""
+            C_FLAGS: ""
+            language-c: c11
+            language-cpp: c++11
+            one-elf-section-per-data: true
+            one-elf-section-per-function: true
+            optimization: level-debug
+            warnings: all-warnings
+          global:
+            $float-abi-type: hard
+            misc-control: []
+            not-use-syscalls: true
+            output-debug-info: enable
+            use-newlib-nano: true
+          linker:
+            $outputTaskExcludes:
+              - .bin
+            LD_FLAGS: ""
+            LIB_FLAGS: -l:libarm_cortexM4lf_math.a
+            output-format: elf
+            remove-unused-input-sections: true
+        scatterFilePath: STM32L432KCUX_FLASH.ld
+        storageLayout:
+          RAM: []
+          ROM: []
+        useCustomScatterFile: true
+    uploadConfigMap:
+      JLink:
+        baseAddr: ""
+        bin: ""
+        cpuInfo:
+          cpuName: "null"
+          vendor: "null"
+        otherCmds: ""
+        proType: 1
+        speed: 8000
+    uploader: JLink

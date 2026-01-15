@@ -39,7 +39,7 @@ ENTRY(Reset_Handler)
 /* Highest address of the user mode stack */
 _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 
-_Min_Heap_Size = 0x400; /* required amount of heap */
+_Min_Heap_Size = 0x1200; /* required amount of heap */
 _Min_Stack_Size = 0x800; /* required amount of stack */
 
 /* Memories definition */
@@ -184,9 +184,10 @@ SECTIONS
     . = ALIGN(8);
   } >RAM
   
-  ._ram2_area :
+  ._ram2_area (NOLOAD) :
   {
   	. = ALIGN(4);
+    * (._ram2_area)
   } >RAM2
 
   /* Remove information from the compiler libraries */

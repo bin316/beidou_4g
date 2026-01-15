@@ -1,2 +1,5 @@
 debug/
 /Debug/
+/build/
+.vscode/
+.settings/
