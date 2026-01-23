@@ -204,8 +204,8 @@ solution_handle fc_solution =
 		},
 	    // AI生成注释: 唤醒源类型，默认为定期唤醒
 	    .wakeSource = util_lowpower_wake_source_e::regular,
-	    // AI生成注释: 是否连接到主服务器的标志位
-	    .connect_to_main_server = false,
+	    // 默认连接到主服务器
+	    .connect_to_main_server = true,
 	    // AI生成注释: 启动时是否更新位置信息的标志位
 	    .updatePositionOnStart = false
     };
@@ -1450,6 +1450,9 @@ void Solution::solution_fact_routine_thread(void *argument)
     // AI生成注释: 连续采样100次，每次间隔100毫秒（总计10秒）
     for (unsigned int i = 0; i < 100; i++)
 	{
+#ifdef DEBUG
+    logInfo("当前角度: %.2f", util_sc7a20_get_status().lean_angle);
+#endif
 	// AI生成注释: 如果检测到设备倾斜，立即跳出循环（检测失败）
 	if (util_sc7a20_get_status().leaned)
 	    break;
@@ -1462,6 +1465,9 @@ void Solution::solution_fact_routine_thread(void *argument)
     if (sample_count < 98)
 	{
 	// AI生成注释: 获取低功耗配置
+#ifdef DEBUG
+    logInfo("脱离检测失败,继续休眠, 计数=%d", sample_count);
+#endif
 	auto lpconfig = util_lowpower_get_config();
 	/*
 	 * $notice 工厂模式下，每过两小时唤醒自身重新检测
@@ -1469,6 +1475,9 @@ void Solution::solution_fact_routine_thread(void *argument)
 	 * */
 	// AI生成注释: 设置工厂模式下的休眠周期（配置文件中定义的时间）
 	lpconfig.requested_wakeup_period = PROD_CONFIG_FACTORY_SLEEP_PERIOD_SEC;
+#ifdef DEBUG
+    lpconfig.requested_wakeup_period = 30; //debug时设置为30s唤醒一次
+#endif
 	// AI生成注释: 设置剩余唤醒时间
 	lpconfig.wakeup_remain = PROD_CONFIG_FACTORY_SLEEP_PERIOD_SEC;
 	// AI生成注释: 禁用外部唤醒引脚，防止震动唤醒干扰检测
@@ -1481,8 +1490,8 @@ void Solution::solution_fact_routine_thread(void *argument)
     /*系统激活*/
     // AI生成注释: 检测通过，切换到工作模式
     pthis->rt_solution.mode = wm_work;			//进入空闲模式
-    // AI生成注释: 设置连接到备用服务器（初始配置中备用服务器和主服务器相同）
-    pthis->rt_solution.connect_to_main_server = false; //连接到备用服务器（默认参数中备用服务器和主服务器相同）
+    
+    pthis->rt_solution.connect_to_main_server = true; //默认连接到主服务器
     // AI生成注释: 设置为非配置编辑模式
     pthis->rt_solution.configEditting = false;		//默认非编辑模式
     // AI生成注释: 清除密码确认标志

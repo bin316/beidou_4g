@@ -52,7 +52,7 @@
 #define PROD_CONFIG_FACTORY_VIBRATION_DEBOUNCE_SEC    2
 
 /*出厂默认工作模式 $notice 仅用于测试*/
-#define PROD_CONFIG_FACTORY_DEFAULT_WORK_MODE    solution_mode_e::wm_work
+#define PROD_CONFIG_FACTORY_DEFAULT_WORK_MODE    solution_mode_e::wm_factory
 
 /*是否启用了独立看门狗？*/
 #define PROD_CONFIG_FACTORY_ENABLE_IWDG    1

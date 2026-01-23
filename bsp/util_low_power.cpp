@@ -10,7 +10,9 @@
 #include "main.h"
 #include "i2c.h"
 #include "rtc.h"
-
+#ifdef DEBUG
+#include "usart.h"
+#endif
 #if PROD_CONFIG_FACTORY_ENABLE_IWDG
 #include "iwdg.h"
 #endif
@@ -243,6 +245,10 @@ void util_lowpower_standby(void) {
 	__HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
 	__HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
 
+#ifdef DEBUG
+	// 串口日志已经失效，使用普通的串口打印输出
+	uartPrintStr(&huart2, "\r\n进入休眠状态\r\n");
+#endif
 	HAL_PWR_EnterSTANDBYMode();
 
 	/*should never reach here*/
@@ -293,7 +299,7 @@ void util_lowpower_update_rtc(time_t time) {
 	logInfo("rtc set: %02d:%02d:%02d %02d/%02d/%02d", sTime.Hours,
 			sTime.Minutes, sTime.Seconds, sDate.Year + 2000, sDate.Month,
 			sDate.Date);
-
+	logInfo("rtc timestamp: %ld", (long)time);
 	HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 	HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 }

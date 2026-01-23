@@ -431,7 +431,7 @@ float util_sc7a20_sample_angle(uint32_t average_count, uint32_t delay) {
 
 	for (uint32_t i = 0; i < average_count; i++) {
 		vTaskDelay(pdMS_TO_TICKS(delay));
-		sum += rt_sc7a20.status.pitch;
+		sum += rt_sc7a20.status.lean_angle;
 	}
 	sampled_angle = sum / average_count;
 	return sampled_angle;
