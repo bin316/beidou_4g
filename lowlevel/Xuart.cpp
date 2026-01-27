@@ -67,11 +67,12 @@ bool Xuart::isOpened(Xuart *instance) {
     return false;
 }
 
-int Xuart::open(void) {
+int Xuart::open(mode_t mode) {
     /*do not open twice*/
     if (isOpened(this)) {
         return EBUSY;
     }
+    this->current_mode = mode;
     /*try to allocate resources*/
     int allocate_result = allocate_resources();
     if (allocate_result != 0) {
@@ -83,13 +84,22 @@ int Xuart::open(void) {
         return ENOMEM;
     }
     /*register callbacks*/
+    // 错误回调
     HAL_UART_RegisterCallback(phuart, HAL_UART_ERROR_CB_ID, isr_uart_error);
-    HAL_UART_RegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID,
-            isr_uart_tx_complete);
-    HAL_UART_RegisterRxEventCallback(phuart, isr_uart_rti);
-    /*start receive*/
-    HAL_UARTEx_ReceiveToIdle_DMA(phuart, this->rx_dma_buffer,
-            this->rx_dma_size);
+
+    // 发送完成回调
+    if (mode == Mode_FullDuplex || mode == Mode_TxOnly) {
+        HAL_UART_RegisterCallback(phuart, HAL_UART_TX_COMPLETE_CB_ID, isr_uart_tx_complete);
+    }
+
+    // 接收回调
+    if (mode == Mode_FullDuplex || mode == Mode_RxOnly) {
+        HAL_UART_RegisterRxEventCallback(phuart, isr_uart_rti);
+        HAL_UARTEx_ReceiveToIdle_DMA(phuart, this->rx_dma_buffer, this->rx_dma_size);
+    } else {
+        HAL_UART_UnRegisterRxEventCallback(phuart);
+    }
+    
     /*success*/
     return 0;
 }

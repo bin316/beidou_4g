@@ -44,9 +44,15 @@ public:
 		baudrate, stop_bits, data_bits, parity, rx_flush, tx_flush
 	} io_opt_t;
 
+	typedef enum {
+		Mode_FullDuplex,
+		Mode_TxOnly,
+		Mode_RxOnly
+	} mode_t;
+
 	int read(void *data, size_t size, uint32_t timeout = portMAX_DELAY);
 	int write(void *data, size_t size, uint32_t timeout = portMAX_DELAY);
-	int open(void);
+	int open(mode_t mode = Mode_FullDuplex);
 	int close(void);
 
 	int print(const char *fmt, ...);
@@ -55,6 +61,7 @@ public:
 	int ioctl(int cmd, void *arg);
 
 private:
+	mode_t current_mode = Mode_FullDuplex;
 
 	UART_HandleTypeDef *phuart = NULL;
 	size_t tx_dma_size = 0;

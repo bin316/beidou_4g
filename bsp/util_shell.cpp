@@ -56,8 +56,7 @@ static void shell_connect(void) {
 	shellInit(&shell, shellBuffer, 512);
 	logRegister(&shellLogger, &shell);
 
-	xTaskCreate(shellTask, "shell_tsk", 512, &shell, osPriorityNormal,
-			&shellTaskHandle);
+	// xTaskCreate(shellTask, "shell_tsk", 512, &shell, osPriorityNormal, &shellTaskHandle);
 }
 
 static void shell_disconnect(void) {
@@ -94,9 +93,10 @@ void __util_shell_init__(void) {
 	shellUart = new Xuart(&huart2, 512, 512, 512, 512);
 	configASSERT(shellUart);
 
-	shellUart->open();
+	shellUart->open(Xuart::Mode_TxOnly);
 
-	shell.read = shellRead;
+	// shell.read = shellRead;
+	shell.read = NULL;
 	shell.write = shellWrite;
 
 	shellLogger.write = logWritter;
