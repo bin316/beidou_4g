@@ -32,7 +32,8 @@
 #include "usart.h"
 #include "NVM.h"
 
-static const util_atgm332d_status_t default_status = { 114.350161f, 30.528721f,
+// static const util_atgm332d_status_t default_status = { 116.397477f, 39.908692f,
+static const util_atgm332d_status_t default_status = { 0.10, 10.0,
 		1739245514, false };
 
 static util_atgm332d_status_t status;
@@ -78,10 +79,11 @@ static void atgm332d_rx_thread(void *argument) {
 		status.longitude = rmc->longitude;
 		status.time = rmc->unixTime;
 		status.position_fixed = true;
-		atgm332d_UpdateLocalTime();
+		// atgm332d_UpdateLocalTime();
 		nvm_atgm332d->save();
 
-		logInfo("updated pos: [lon%f, la%f]", status.longitude, status.latitude);
+		// logInfo("updated pos: [lon%f, la%f]", status.longitude, status.latitude);
+		logInfo("北斗定位已更新: 经度%f, 纬度%f, 时间戳（秒）%ld", status.longitude, status.latitude, status.time);
 
 		/*激活后首次更新*/
 		if (!updated_since_activate) {

@@ -14,12 +14,18 @@
 /*工厂模式休眠周期*/
 #define PROD_CONFIG_FACTORY_SLEEP_PERIOD_SEC    7200
 
+/**
+ * 目标测试项   目标 ID     后四位 (十进制)	转换后的 INDEX (十六进制)
+ * 测试001      90884390    4390            0x1126
+ * 测试002      90884391    4391            0x1127
+ * 测试003      90884392    4392            0x1128
+ */
 /*出厂默认测试代号MAJOR*/
 #define PROD_CONFIG_FACTORY_DEFAULT_CODE_MAJOR    'Z'
 /*出厂默认测试代号MINOR*/
 #define PROD_CONFIG_FACTORY_DEFAULT_CODE_MINOR    'X'
 /*出厂默认测试代号INDEX*/
-#define PROD_CONFIG_FACTORY_DEFAULT_CODE_INDEX    0x1124
+#define PROD_CONFIG_FACTORY_DEFAULT_CODE_INDEX    0x1126
 /*出厂是否生成随机界桩编号*/
 #define PROD_CONFIG_FACTORY_GENERATE_UNIQ_INDEX    0
 
