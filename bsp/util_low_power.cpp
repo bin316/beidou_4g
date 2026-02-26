@@ -148,7 +148,7 @@ void __util_lowpower_init__(void) {
 		seconds = 64800;
 		rt_lowpower_config.wakeup_remain -= 64800;
 	} else {
-		/*如果剩余休眠时间小于18h...*/
+		/*如果剩余休眠时间小于18h...*/            
 		seconds = rt_lowpower_config.wakeup_remain;
 		rt_lowpower_config.wakeup_remain = 0;
 	}
@@ -172,6 +172,9 @@ void __util_lowpower_init__(void) {
 
 	// 进入待机模式
 //	HAL_PWREx_EnterSHUTDOWNMode();
+	HAL_PWREx_EnablePullUpPullDownConfig(); // 允许 Standby 模式下的上下拉配置
+	HAL_PWREx_EnableGPIOPullDown(PWR_GPIO_A, PWR_GPIO_BIT_0);
+	HAL_PWREx_EnableGPIOPullDown(PWR_GPIO_A, PWR_GPIO_BIT_1);
 	HAL_PWR_EnterSTANDBYMode();
 }
 
@@ -225,6 +228,10 @@ void util_lowpower_standby(void) {
 	} else {
 		HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN1);
 	}
+
+	// debug: 强制禁用唤醒引脚
+	// HAL_PWR_DisableWakeUpPin(PWR_WAKEUP_PIN1);
+
 // 设置RTC唤醒定时器
 	HAL_RTCEx_SetWakeUpTimer_IT(&hrtc,
 			(seconds > 2) ? (seconds - 1) : (seconds),
@@ -249,6 +256,10 @@ void util_lowpower_standby(void) {
 	// 串口日志已经失效，使用普通的串口打印输出
 	uartPrintStr(&huart2, "\r\n进入休眠状态\r\n");
 #endif
+
+	HAL_PWREx_EnablePullUpPullDownConfig(); // 允许 Standby 模式下的上下拉配置
+	HAL_PWREx_EnableGPIOPullDown(PWR_GPIO_A, PWR_GPIO_BIT_0);
+	HAL_PWREx_EnableGPIOPullDown(PWR_GPIO_A, PWR_GPIO_BIT_1);
 	HAL_PWR_EnterSTANDBYMode();
 
 	/*should never reach here*/

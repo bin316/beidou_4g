@@ -48,7 +48,7 @@
 /*出厂默认定位搜索完成倒计时*/
 #define PROD_CONFIG_FACTORY_GNSS_SEARCH_COMPLETE_TIMEOUT    15
 /*出厂默认网络良好唤醒倒计时(分钟)*/
-#define PROD_CONFIG_FACTORY_NET_GOOD_WAKEUP_TIMEOUT_MIN    2880
+#define PROD_CONFIG_FACTORY_NET_GOOD_WAKEUP_TIMEOUT_MIN    720
 /*出厂默认网络差唤醒倒计时(分钟)*/
 #define PROD_CONFIG_FACTORY_NET_BAD_WAKEUP_TIMEOUT_MIN    15
 /*出厂默认服务器响应超时 */
@@ -58,7 +58,7 @@
 #define PROD_CONFIG_FACTORY_VIBRATION_DEBOUNCE_SEC    2
 
 /*出厂默认工作模式 $notice 仅用于测试*/
-#define PROD_CONFIG_FACTORY_DEFAULT_WORK_MODE    solution_mode_e::wm_factory
+#define PROD_CONFIG_FACTORY_DEFAULT_WORK_MODE    solution_mode_e::wm_work
 
 /*是否启用了独立看门狗？*/
 #define PROD_CONFIG_FACTORY_ENABLE_IWDG    1
