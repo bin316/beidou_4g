@@ -3,6 +3,12 @@
  *
  *  Created on: Jan 22, 2025
  *      Author: IRIS
+ *
+ * ------------------------------------------------------------------------------
+ * 卫星数量解析说明
+ * ------------------------------------------------------------------------------
+ * parseGgaMessage() / parseGGA() 解析 GGA 语句第 8 字段 numSv，写入 GGA_t::satelliteCount，
+ * 供 util_atgm332d 更新 status.sats，用于上报数据包。
  */
 
 #include <NMEA0183.h>
@@ -70,6 +76,58 @@ bool NMEA0183::parseRmcMessage()
     this->paramView = string_view(&msgView[msgView.find(",") + 1],
 	    msgView.find("*") - msgView.find(",") - 1);
     return parseRMC();
+    }
+
+bool NMEA0183::parseGgaMessage()
+    {
+    /* 查找 GGA 句子起始位置 */
+    size_t ggaPos = sv.find("GGA");
+    if (ggaPos == string_view::npos)
+	return false;
+    /* 向前找到该句子的 $ 起始符 */
+    size_t ggaSentenceBegin = sv.rfind("$", ggaPos);
+    if (ggaSentenceBegin == string_view::npos)
+	return false;
+    size_t ggaSentenceEnd = sv.find("\r\n", ggaSentenceBegin);
+    if (ggaSentenceEnd == string_view::npos)
+	ggaSentenceEnd = sv.size();
+    string_view sentence = sv.substr(ggaSentenceBegin,
+	    ggaSentenceEnd - ggaSentenceBegin);
+    if (!checkSum(sentence))
+	return false;
+    this->msgView = sentence;
+    parseSysType();
+    this->message.content = GGA_t();
+    this->paramView = string_view(&msgView[msgView.find(",") + 1],
+	    msgView.find("*") - msgView.find(",") - 1);
+    return parseGGA();
+    }
+
+bool NMEA0183::parseGGA(void)
+    {
+    if (this->paramView.data() == NULL)
+	return false;
+    /* GGA 格式：UTCtime,lat,uLat,lon,uLon,FS,numSv,HDOP,...
+     * paramView 不含消息头，numSv 为第 7 个字段，需跳过前 6 个逗号 */
+    string_view pv = this->paramView;
+    size_t pos = 0;
+    for (int i = 0; i < 6; i++)
+	{
+	pos = pv.find(",", pos);
+	if (pos == string_view::npos)
+	    return false;
+	pos++;
+	}
+    int numSv = 0;
+    if (sscanf(pv.data() + pos, "%d", &numSv) < 1)
+	return false;
+    if (numSv < 0)
+	numSv = 0;
+    if (numSv > 24)
+	numSv = 24;
+    auto gga = getContent<GGA_t>();
+    gga->satelliteCount = (uint8_t) numSv;
+    return true;
     }
 
 bool NMEA0183::checkSum(string_view sentence)

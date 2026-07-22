@@ -1,3 +1,12 @@
+/*
+ * NMEA0183.h
+ *
+ * ------------------------------------------------------------------------------
+ * 卫星数量解析说明
+ * ------------------------------------------------------------------------------
+ * parseGgaMessage() 用于解析 GGA 语句，提取第 8 字段 numSv（用于定位的卫星数），
+ * 供北斗驱动更新 status.sats，用于上报数据包中的定位质量字段。
+ */
 #pragma once
 #include <stdint.h>
 
@@ -470,6 +479,7 @@ public:
 	int parseSysType(void);
 	/*find and parse the next NMEA message in the message field*/
 	bool parseRmcMessage();
+	bool parseGgaMessage();
 
 	template<typename T>
 	T* getContent() {
@@ -494,5 +504,6 @@ private:
 	 */
 
 	bool parseRMC(void);
+	bool parseGGA(void);
 
 };

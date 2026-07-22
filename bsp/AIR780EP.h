@@ -64,12 +64,10 @@ public:
 
 	~AIR780EP();
 
-	/*
-	 * @brief connect to the server
-	 * @return 0 for success, -1 for error
-	 *
+	/**
+	 * @brief 连接 TCP；timeout_ms>0 且 server_debug 时走 AGNSS 短连（对齐 Slope）
 	 */
-	bool connect(air780_server_t server = server_main);
+	bool connect(air780_server_t server = server_main, uint32_t timeout_ms = 0);
 	bool disconnect(air780_server_t server = server_main);
 
 	/*
@@ -157,9 +155,9 @@ public:
 		bool sendPrompt = false;
 		bool dataAccept = false;
 
-		int ber = 0;
-		int csq = 0;
-		time_t time = 0;
+        uint8_t ber = 0;
+        uint8_t csq = 0;
+        time_t time = 0;
 	} status;
 	params_t params;
 
@@ -180,10 +178,29 @@ public:
 		CIPCLOSE,
 		CIPSTART,
 		CIPSTATUS,
+		CIPGSMLOC,
 		__invalid,
 	} rx_content_t;
 
+	/** AT+CIPGSMLOC 解析结果 */
+	struct LbsResult {
+		bool ok = false;
+		uint16_t code = 0;
+		float latitude = 0.f;
+		float longitude = 0.f;
+	};
+
 	bool sendCmd(size_t optime, rx_content_t rx, const char *fmt, ...);
+
+	int getCsq();
+
+	/**
+	 * @brief 基站定位 AT+CIPGSMLOC（简单一次查询）
+	 * @param out 结果；ok=true 表示拿到 lat/lon
+	 */
+	bool query_lbs(LbsResult *out, uint32_t timeout_ms = 35000u);
+
+public:
 
 private:
 	Xuart *uart;
@@ -192,8 +209,6 @@ private:
 
 	MessageBufferHandle_t msgBuffer[3] = {
 	NULL, NULL, NULL };
-
-	int getCsq();
 
 	int setAutoSleepTimeout(uint32_t time);
 
@@ -215,7 +230,12 @@ private:
 			false };
 
 	SemaphoreHandle_t cmdSem = NULL;
+	/** 互斥 CIPSTART/CIPSEND/CIPCLOSE/CSQ/CIPGSMLOC，避免与 AGNSS link2 交错 AT */
+	SemaphoreHandle_t at_mutex_ = NULL;
 	rx_content_t listeningRx;
+
+	bool lbs_result_ready_ = false;
+	LbsResult lbs_result_{};
 };
 
 #endif /* AIR780EP_H_ */

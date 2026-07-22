@@ -224,7 +224,7 @@ void util_analog_timer_callback(ADC_HandleTypeDef *adc)
 		* analog_rt.status.vdda * 2.0f;
 	if (vbat_dedicate < 0.0f || vbat_dedicate > 5.0f)
 	    {
-	    logError("Vbat dedicate value out of range");
+	    logError("电池电压(专用通道): 读数超范围");
 	    vbat_dedicate = 0.0f;
 	    }
 	}
@@ -236,7 +236,7 @@ void util_analog_timer_callback(ADC_HandleTypeDef *adc)
 		* analog_rt.status.vdda * 3.0f;
 	if (vbat_internal < 0.0f || vbat_internal > 5.0f)
 	    {
-	    logError("Vbat internal value out of range");
+	    logError("电池电压(内部通道): 读数超范围");
 	    vbat_internal = 0.0f;
 	    }
 	}
@@ -282,7 +282,7 @@ void __util_analog_init__(void)
 	{
 	analog_nvm->restoreDefault();
 	analog_nvm->save();
-	logInfo("initially restored..");
+	logInfo("NVM: 已恢复出厂默认");
 	}
 
     HAL_ADC_RegisterCallback(&hadc1, HAL_ADC_CONVERSION_COMPLETE_CB_ID,
@@ -291,7 +291,7 @@ void __util_analog_init__(void)
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*) analog_dma_buffer, 4);
 
     analog_rt.status.mode = analog_run;
-    logInfo("adc started..");
+    logInfo("ADC: 已启动");
     }
 
 /**
@@ -333,7 +333,7 @@ void util_analog_suspend(void)
     //so we can stop the ADC to suspend the analog utilities
     HAL_ADC_Stop_DMA(&hadc1);
     analog_rt.status.mode = analog_stop;
-    logInfo("adc stopped..");
+    logInfo("ADC: 已停止");
     }
 
 void util_analog_resume(void)
@@ -341,5 +341,5 @@ void util_analog_resume(void)
     // Resume the ADC to continue processing
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*) analog_dma_buffer, 4);
     analog_rt.status.mode = analog_run;
-    logInfo("adc resumed..");
+    logInfo("ADC: 已恢复");
     }

@@ -3,6 +3,20 @@
  *
  *  Created on: Oct 21, 2024
  *      Author: IRIS
+ *
+ * ------------------------------------------------------------------------------
+ * 卫星数量 sats 字段说明
+ * ------------------------------------------------------------------------------
+ * util_atgm332d_status_t 中的 sats 表示用于定位的卫星数量，来自 GGA 的 numSv，
+ * 范围 0~24，供上报数据包使用。
+ *
+ * ------------------------------------------------------------------------------
+ * 定位状态 position_fixed 与“上报后置否”
+ * ------------------------------------------------------------------------------
+ * position_fixed 表示经纬度是否为新的定位数据，对应协议 status 的 bit0（定位状态位）。
+ * 上报数据后调用 util_atgm332d_clear_fix_flag() 将其置否，下一帧仅在有新 RMC 时
+ * 才再置 1，避免多帧共用同一次定位却均标为“新”。详见 solution/Solution.cpp、
+ * bsp/util_atgm332d.cpp、solution/Protocol.h。
  */
 
 #ifndef UTILTIES_H_
@@ -47,6 +61,10 @@ typedef enum : uint32_t {
 	message, /**< Message event */
 	network_confirmed, /**< Network confirmed event */
 	gnss_update, /**< GNSS update event */
+	/** 服务器超时：仅投递，由工作线程执行 report（勿在 Timer 任务里做） */
+	server_report_due,
+	/** 设备在线超时：仅投递，由工作线程执行 standby */
+	device_sleep_due,
 } util_event_code_t;
 
 /**
@@ -123,8 +141,8 @@ typedef struct {
 	float leanDetectOffset; /**< Calibration angle for lean detection */
 	uint8_t range; /**< Range for lean detection */
 	uint8_t acc_thres16mg_lsb; /**< Acceleration threshold in 16mg LSB */
-	uint32_t cool_down_timeout; /**< Timeout for lean detection */
-	uint32_t update_period; /**< Update period for the sensor */
+	uint32_t cool_down_timeout; /**< 震动消抖/冷却时间，单位 ms */
+	uint32_t update_period; /**< 姿态更新周期，单位 ms */
 } util_sc7a20_config_s;
 
 /**
@@ -184,6 +202,8 @@ void util_sc7a20_set_config(util_sc7a20_config_s config);
 util_sc7a20_config_s util_sc7a20_get_config(void);
 
 void util_sc7a20_clear_vibration_flag(void);
+/** 标记曾发生震动（如 Standby 引脚唤醒后补记，供 status 震动位） */
+void util_sc7a20_mark_vibration(void);
 
 /**
  * @brief Sample the angle of the SC7A20 sensor.
@@ -397,18 +417,47 @@ void util_analog_resume(void);
 
 
 void __util_shell_init__(void);
+/** 通过 SEGGER RTT 输出调试日志（不占 UART2，可与北斗同时使用） */
+void __util_rtt_log_init__(void);
 
 typedef struct {
 	float longitude;
 	float latitude;
 	time_t time;
 	int position_fixed;
+	uint8_t sats; //用于定位的卫星数量，0~24，来自GGA的numSv
+	/** 上次实际发出 CIPGSMLOC 的 RTC 秒（合宙 4h 限频，对齐 Slope） */
+	uint32_t lbs_last_query_unix;
 } util_atgm332d_status_t;
 
 void __util_atgm332d_init__(void);
 void util_atgm332d_load(void);
 void util_atgm332d_activate(uint32_t hysteresis_sec);
 void util_atgm332d_deactivate(void);
+void util_atgm332d_clear_fix_flag(void);
+/** 新唤醒周期：清本周期 LBS 成功标志（对齐 Slope sys_gnss_nvm_session_begin） */
+void util_atgm332d_wake_session_begin(void);
+/** true=距上次查询已满免费限频；未满会打跳过日志 */
+bool util_atgm332d_lbs_interval_elapsed(void);
+/** 记录一次已发出的 CIPGSMLOC（成功/失败都占配额）；延迟落盘 */
+void util_atgm332d_lbs_note_query_sent(void);
+/** 本唤醒是否已有 LBS 成功点（供 report geoStat） */
+bool util_atgm332d_lbs_ok_this_wake(void);
+/** 上报用：本周期 GNSS fix 或本周期 LBS 成功 */
+bool util_atgm332d_geo_valid_for_report(void);
+/** 脏页落盘（进休眠前调用） */
+void util_atgm332d_nvm_flush(void);
+/** 服务器写入经纬度（持久化到北斗 NVM，供后续上报使用） */
+bool util_atgm332d_set_manual_geo(float lon, float lat);
+/** LBS 成功写经纬度；本周期 geoStat=1，不立刻擦 Flash（对齐 Slope） */
+bool util_atgm332d_apply_lbs_geo(float lon, float lat);
+/** 向北斗 UART 注入 CASBIN（AGNSS，整段） */
+bool util_atgm332d_inject_casbin(const uint8_t *data, size_t len,
+	uint32_t inter_chunk_ms);
+/** 流式注入：开始前清 RX；随后多次 write */
+bool util_atgm332d_casbin_stream_begin(void);
+bool util_atgm332d_casbin_stream_write(const uint8_t *data, size_t len,
+	uint32_t inter_chunk_ms);
 util_atgm332d_status_t util_atgm332d_get_status(void);
 
 #endif /* UTILTIES_H_ */

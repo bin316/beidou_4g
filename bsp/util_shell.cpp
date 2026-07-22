@@ -42,11 +42,11 @@
 #include "semphr.h"
 
 #include "Xuart.h"
+#include "SEGGER_RTT.h"
 
 Xuart *shellUart = NULL;
 Shell shell;
 Log shellLogger;
-TaskHandle_t shellTaskHandle = NULL;
 char *shellBuffer = NULL;
 
 static void shell_connect(void) {
@@ -55,18 +55,6 @@ static void shell_connect(void) {
 
 	shellInit(&shell, shellBuffer, 512);
 	logRegister(&shellLogger, &shell);
-
-	// xTaskCreate(shellTask, "shell_tsk", 512, &shell, osPriorityNormal, &shellTaskHandle);
-}
-
-static void shell_disconnect(void) {
-	vTaskDelete(shellTaskHandle);
-
-	logUnRegister(&shellLogger);
-	shellDeInit(&shell);
-
-	vPortFree(shellBuffer);
-	shellBuffer = NULL;
 }
 
 short shellWrite(char *data, unsigned short len) {
@@ -105,4 +93,29 @@ void __util_shell_init__(void) {
 	shellLogger.level = LOG_VERBOSE;
 
 	shell_connect();
+}
+
+/**
+ * @brief 通过 SEGGER RTT（SWD）输出 logInfo 等日志，不占用 UART2
+ * @note 与 __util_shell_init__ 二选一；需 ST-Link + OpenOCD/RTT Viewer 查看
+ */
+void __util_rtt_log_init__(void) {
+	SEGGER_RTT_Init();
+
+	auto rttLogWriter = [](char *str, short size) {
+		if (shellLogger.shell) {
+			SEGGER_RTT_Write(0, str, size);
+		}
+	};
+
+	shellLogger.write = rttLogWriter;
+	shellLogger.active = true;
+	shellLogger.shell = &shell;
+	shellLogger.level = LOG_VERBOSE;
+
+	shellBuffer = (char*) pvPortMalloc(512);
+	configASSERT(shellBuffer != NULL);
+
+	shellInit(&shell, shellBuffer, 512);
+	logRegister(&shellLogger, &shell);
 }

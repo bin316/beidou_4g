@@ -22,20 +22,19 @@
 #include "event_groups.h"
 
 #include "utilties.h"
+#include "log.h"
 
 static QueueHandle_t event_queue;
 
 #define IDLE_EVENT_DELAY 100
 
 void __util_events_init__(void) {
-//	创建事件组
 	event_queue = xQueueCreate(16, sizeof(util_event_code_t));
 	configASSERT(event_queue);
-	logInfo("event queue module initialized.");
+	logInfo("事件队列: 已初始化");
 }
 
 void util_events_generate(util_event_code_t code) {
-//	发送事件
 	if (xPortIsInsideInterrupt()) {
 		xQueueSendFromISR(event_queue, &code, NULL);
 	} else {
@@ -52,8 +51,13 @@ bool util_events_poll_nonblocked(util_event_code_t *code) {
 }
 
 int util_events_flush(void) {
-	if (xQueueReset(event_queue) == pdPASS)
-		return 0;
-	return -1;
+	int dropped = 0;
+	util_event_code_t code;
+	while (xQueueReceive(event_queue, &code, 0) == pdPASS) {
+		dropped++;
+	}
+	if (dropped > 0) {
+		logInfo("事件队列: 清空%d条", dropped);
+	}
+	return 0;
 }
-

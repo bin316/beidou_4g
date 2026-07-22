@@ -77,7 +77,7 @@ void __util_lowpower_init__(void) {
 	if (nvm_lopwr->isFactoryDefault()) {
 		nvm_lopwr->restoreDefault();
 		nvm_lopwr->save();
-		logInfo("initially restored..");
+		logInfo("NVM: 已恢复出厂默认");
 	}
 
 	/*timezone setup*/
@@ -85,12 +85,21 @@ void __util_lowpower_init__(void) {
 //	unsetenv("TZ"); // 设置为 UTC
 	tzset();             // 更新时区设置
 
-	// 检查IWDG复位标志
-	if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) {
-		// 处理IWDG复位事件（如记录日志、点亮LED等）
-		// 示例：通过串口输出复位信息
-		logWarning("watchdog triggered!");
-		// 清除复位标志
+	/* 上电打印复位原因，便于区分 IWDG / SoftReset(HardFault后) / 引脚复位 */
+	{
+		const uint32_t csr = RCC->CSR;
+		if (csr & RCC_CSR_IWDGRSTF) {
+			logWarning("复位原因: 独立看门狗(IWDG)");
+		}
+		if (csr & RCC_CSR_SFTRSTF) {
+			logWarning("复位原因: 软件复位(常见于HardFault闪灯后SystemReset)");
+		}
+		if (csr & RCC_CSR_PINRSTF) {
+			logInfo("复位原因: NRST引脚(常与其它标志同时置位)");
+		}
+		if (csr & RCC_CSR_BORRSTF) {
+			logWarning("复位原因: 欠压BOR");
+		}
 		__HAL_RCC_CLEAR_RESET_FLAGS();
 	}
 
@@ -104,7 +113,7 @@ void __util_lowpower_init__(void) {
 	NULL, util_lowpower_iwdg_refresh_timer_callback);
 	configASSERT(iwdg_feed_timer!=NULL);
 	xTimerStart(iwdg_feed_timer, portMAX_DELAY);
-	logInfo("watchdog feed timer created..");
+	logInfo("看门狗: 喂狗定时器已创建");
 #endif
 // 检查是否是由Wake Up引脚唤醒
 	if (__HAL_PWR_GET_FLAG(PWR_FLAG_WU) || INT1_PIN_STATE
@@ -120,24 +129,17 @@ void __util_lowpower_init__(void) {
 	} else {
 		wake_source = util_lowpower_wake_source_e::regular;
 	}
-	logInfo("wake source: %s..", enum_name(wake_source).data());
+	logInfo("唤醒源: %s", enum_name(wake_source).data());
 
 	if (rt_lowpower_config.wakeup_remain == 0) {
-		/*如果剩余时间为0不继续休眠过程*/
-		logInfo("standby exited..");
+		logInfo("低功耗: 休眠结束(剩余0)");
 		return;
 	}
 	if (rt_lowpower_config.wake_pin_enable
 			&& wake_source == util_lowpower_wake_source_e::pin) {
-		/*如果唤醒源不是rtc
-		 * 1.长期休眠可能被打断
-		 * 2.正常上电启动，无需休眠
-		 *
-		 * 清空剩余休眠时间，保存，然后退出休眠状态
-		 */
 		rt_lowpower_config.wakeup_remain = 0;
 		nvm_lopwr->save();
-		logInfo("standby aborted by pin..");
+		logInfo("低功耗: 引脚打断休眠");
 		return;
 	}
 
@@ -153,7 +155,7 @@ void __util_lowpower_init__(void) {
 		rt_lowpower_config.wakeup_remain = 0;
 	}
 
-	logInfo("standby continued, %d seconds left..",
+	logInfo("低功耗: 继续休眠, 剩余%d秒",
 			rt_lowpower_config.wakeup_remain);
 
 	nvm_lopwr->save();
@@ -189,7 +191,7 @@ void __util_lowpower_init__(void) {
 void util_lowpower_standby(void) {
 	unsigned int seconds;
 	bool wake_pin_enable = rt_lowpower_config.wake_pin_enable;
-	logInfo("wakeup pin %s", wake_pin_enable ? "enabled" : "disabled");
+	logInfo("低功耗: 唤醒引脚%s", wake_pin_enable ? "开" : "关");
 	/*
 	 * 根据requested_wakeup_period开启一次新的休眠
 	 * */
@@ -208,10 +210,10 @@ void util_lowpower_standby(void) {
 		rt_lowpower_config.wakeup_remain = 0;
 	}
 
-	logInfo("requested_wakeup_period %d secs",
+	logInfo("低功耗: 请求休眠%d秒",
 			rt_lowpower_config.requested_wakeup_period);
-	logInfo("wakeup countdown remain %d secs", rt_lowpower_config.wakeup_remain);
-	logInfo("sleep countdown for this cycle %d secs", seconds);
+	logInfo("低功耗: 剩余分段%d秒", rt_lowpower_config.wakeup_remain);
+	logInfo("低功耗: 本段休眠%d秒", seconds);
 
 	nvm_lopwr->save();
 
@@ -307,10 +309,10 @@ void util_lowpower_update_rtc(time_t time) {
 	sDate.Date = local->tm_mday;
 	sDate.Year = local->tm_year - 100;
 
-	logInfo("rtc set: %02d:%02d:%02d %02d/%02d/%02d", sTime.Hours,
+	logInfo("RTC: 已设置 %02d:%02d:%02d %02d/%02d/%02d", sTime.Hours,
 			sTime.Minutes, sTime.Seconds, sDate.Year + 2000, sDate.Month,
 			sDate.Date);
-	logInfo("rtc timestamp: %ld", (long)time);
+	logInfo("RTC: 时间戳 %ld", (long)time);
 	HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 	HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 }

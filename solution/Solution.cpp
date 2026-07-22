@@ -4,6 +4,8 @@
  *  Created on: Jan 22, 2025
  *      Author: IRIS
  *      AI生成注释: 此文件实现了北斗界桩设备的核心解决方案类，包含设备的工作模式、通信协议、参数配置等主要功能
+ *
+ *
  */
 
 /*
@@ -97,6 +99,51 @@
  * ■ 容错机制: CRC校验、连接重试、配置备份
  * ■ 双服务器支持: 主服务器+备用服务器冗余设计
  * 
+ * 修改运行配置流程：
+ * 1. 服务器发送进入配置模式请求附带对应的设备密码，对应功能码为09
+ * 2. 设备验证密码正确后进入配置编辑状态，等待服务器发送新的配置参数，功能码为08
+ * 3. 服务器发送新的配置参数，功能码为05
+ * 4. 设备验证新配置参数的合法性，合法则保存到NVM并回复成功响应，功能码为04
+ * 由于使能界桩配置模式与修改密码对应的都是09功能码，要注意应答回复，如果失败有可能是服务器端未接收到08功能码，
+ * 会再次发送09功能码，导致设备进入修改密码状态
+ * 
+ * 在定期唤醒和震动唤醒时：
+ * 如果两分钟搜星没完成会命令上传数据  四分钟搜星没完成会进入休眠(低功耗)
+ * 
+ * 更改内容：
+ * 添加对服务器端回复心跳包的处理操作
+ * 非震动唤醒在收到回复心跳包之后进入休眠状态
+ * 震动唤醒忽略收到的回复心跳包
+ * ------------------------------------------------------------------------------
+ * 定位状态标志位“上报后置否”设计说明
+ * ------------------------------------------------------------------------------
+ * 协议中 pb_report.status 的 bit0 为定位状态位（position_fixed），表示本帧
+ * 上报的 geo[] 是否为新定位数据：1=新定位数据，0=非新/旧定位数据。
+ * 设计策略：每次在 report() 中成功发送上报数据后，立即调用
+ * util_atgm332d_clear_fix_flag() 将北斗模块内部的 position_fixed 置为 false。
+ * 目的与效果：
+ *   - 下一帧上报时，只有在上次上报之后又解析到新的 RMC，定位状态位才会
+ *     再次为 1；否则为 0。避免多帧共用同一次定位结果却均标为“新”。 
+ *   - 提升服务器端对“本帧是否为新定位数据”的语义准确性，减少将旧位置误判为
+ *     新定位数据的情况。
+ * 相关接口：util_atgm332d_clear_fix_flag() 定义于 bsp/util_atgm332d.cpp。
+ *
+ * ------------------------------------------------------------------------------
+ * 卫星数量 sats 字段说明
+ * ------------------------------------------------------------------------------
+ * report() 中 rsps.body.report.sats = util_atgm332d_get_status().sats，
+ * 将北斗解析的卫星数量填入上报数据包，用于表示定位质量。
+ *
+ * ------------------------------------------------------------------------------
+ * 定位状态标志位“上报后置否”设计说明
+ * ------------------------------------------------------------------------------
+ * 协议 pb_report.status 的 bit0 为定位状态位，表示本帧 geo[] 是否为新定位数据。
+ * 每次 report() 成功发送后调用 util_atgm332d_clear_fix_flag() 将其置否，使下一帧
+ * 仅在有新 RMC 时才标为“新定位数据”，提升服务器对“是否为新定位数据”判断的准确性。
+ * 详见 bsp/util_atgm332d.cpp、solution/Protocol.h、bsp/utilties.h 中的相关说明。
+ * 
+ * 288-313添加强制使用宏定义中的服务器地址和端口号的代码
+ * 
  * 交接：
  * 双服务器支持没怎么实现，但是后面可以尝试，留有接口。
  * 服务器的ip地址和端口好像是固定不能修改的，我不太记得了。
@@ -121,6 +168,63 @@ using namespace magic_enum;
 
 // AI生成注释: 包含产品配置相关的宏定义和常量
 #include "PRODUCT_CONFIG.h"
+#include "util_agnss.h"
+
+/** locate_switch 有效位：bit0 GNSS / bit1 AGNSS / bit2 LBS（协议约定） */
+static constexpr uint8_t kLocateSwitchMask = 0x07u;
+static constexpr uint8_t kLocateBitGnss = 0x01u;
+static constexpr uint8_t kLocateBitAgnss = 0x02u;
+static constexpr uint8_t kLocateBitLbs = 0x04u;
+
+static bool locate_gnss_on(uint8_t sw)
+    {
+    return (sw & kLocateBitGnss) != 0;
+    }
+static bool locate_agnss_on(uint8_t sw)
+    {
+    return (sw & kLocateBitAgnss) != 0;
+    }
+static bool locate_lbs_on(uint8_t sw)
+    {
+    return (sw & kLocateBitLbs) != 0;
+    }
+
+/** 开 AGNSS 必须同时开 GNSS */
+static bool locate_switch_agnss_without_gnss(uint8_t sw)
+    {
+    return locate_agnss_on(sw) && !locate_gnss_on(sw);
+    }
+
+/** 清预留位；孤立 AGNSS 一并清掉（对齐 Slope，供出厂/上电/写 NVM） */
+static uint8_t locate_switch_normalize(uint8_t locate_switch)
+    {
+    uint8_t v = (uint8_t) (locate_switch & kLocateSwitchMask);
+    if (locate_switch_agnss_without_gnss(v))
+	{
+	v = (uint8_t) (v & (uint8_t) (~kLocateBitAgnss));
+	}
+    return v;
+    }
+
+/**
+ * 出厂默认 locate_switch：三宏 0/1 按位拼装后再 normalize
+ * （改 PRODUCT_CONFIG 三宏只影响恢复出厂；已落盘 NVM 需协议改或擦除）
+ */
+static uint8_t locate_switch_factory_default(void)
+    {
+    const uint8_t raw = (uint8_t) (
+	    ((PROD_CFG_DEFAULT_LOCATE_GNSS) ? 1u : 0u)
+	    | (((PROD_CFG_DEFAULT_LOCATE_AGNSS) ? 1u : 0u) << 1)
+	    | (((PROD_CFG_DEFAULT_LOCATE_LBS) ? 1u : 0u) << 2));
+    return locate_switch_normalize(raw);
+    }
+
+/** 协议下行：AGNSS 无 GNSS 为非法（拒收且不落盘） */
+static bool locate_switch_is_valid(uint8_t sw)
+    {
+    return !locate_switch_agnss_without_gnss(
+	    (uint8_t) (sw & kLocateSwitchMask));
+    }
 
 // AI生成注释: 解决方案任务句柄，用于FreeRTOS任务管理
 TaskHandle_t solution_thread_handle = NULL;
@@ -207,7 +311,9 @@ solution_handle fc_solution =
 	    // 默认连接到主服务器
 	    .connect_to_main_server = true,
 	    // AI生成注释: 启动时是否更新位置信息的标志位
-	    .updatePositionOnStart = false
+	    .updatePositionOnStart = false,
+	    /* 出厂 locateSwitch：PROD_CFG_DEFAULT_LOCATE_* 三宏 → factory_default */
+	    .locate_switch = locate_switch_factory_default()
     };
 
 /**
@@ -226,7 +332,7 @@ Solution::Solution()
      * */
 
     // AI生成注释: 记录解决方案初始化开始日志
-    logInfo("solution init..");
+    logInfo("例程: 初始化");
 
     // AI生成注释: 创建NVM实例，用于参数的持久化存储，包含运行时和出厂配置
     nvm = new NVM(NVM::partition_solution, (uint8_t*) &this->rt_solution,
@@ -235,14 +341,55 @@ Solution::Solution()
     configASSERT(nvm != NULL);
 
     // AI生成注释: 记录NVM创建成功日志
-    logInfo("solution nvm created..");
+    logInfo("例程: NVM已创建");
     // AI生成注释: 从NVM加载配置参数
     nvm->load();
+
+    /* 将运行参数 t5 消抖落到加计冷却（对齐 Slope）；仅变化时写 NVM */
+    {
+    util_sc7a20_config_s sensor_config = util_sc7a20_get_config();
+    const uint32_t want_ms =
+	    (uint32_t) this->rt_solution.runningConfig.t5_motionDetect_delay_sec
+		    * 1000u;
+    if (sensor_config.cool_down_timeout != want_ms)
+	{
+	sensor_config.cool_down_timeout = want_ms;
+	util_sc7a20_set_config(sensor_config);
+	}
+    logInfo("震动消抖: %u秒",
+	    (unsigned) this->rt_solution.runningConfig.t5_motionDetect_delay_sec);
+    }
+
+    // // AI生成注释: 强制设置IP和端口，确保使用宏定义的值
+    // uint8_t default_main_ip[] = PROD_CONFIG_FACTORY_DEFAULT_MAIN_IP;
+    // uint8_t default_aux_ip[] = PROD_CONFIG_FACTORY_DEFAULT_AUX_IP;
+    // this->rt_solution.systemConfig.runServerIP[0] = default_main_ip[0];
+    // this->rt_solution.systemConfig.runServerIP[1] = default_main_ip[1];
+    // this->rt_solution.systemConfig.runServerIP[2] = default_main_ip[2];
+    // this->rt_solution.systemConfig.runServerIP[3] = default_main_ip[3];
+    // this->rt_solution.systemConfig.runServerPort = PROD_CONFIG_FACTORY_DEFAULT_MAIN_PORT;
+    // this->rt_solution.systemConfig.backupServerIP[0] = default_aux_ip[0];
+    // this->rt_solution.systemConfig.backupServerIP[1] = default_aux_ip[1];
+    // this->rt_solution.systemConfig.backupServerIP[2] = default_aux_ip[2];
+    // this->rt_solution.systemConfig.backupServerIP[3] = default_aux_ip[3];
+    // this->rt_solution.systemConfig.backupServerPort = PROD_CONFIG_FACTORY_DEFAULT_AUX_PORT;
+    // logInfo("IP和端口已配置: 主服务器 %d.%d.%d.%d:%d, 备用服务器 %d.%d.%d.%d:%d",
+	//     this->rt_solution.systemConfig.runServerIP[0],
+	//     this->rt_solution.systemConfig.runServerIP[1],
+	//     this->rt_solution.systemConfig.runServerIP[2],
+	//     this->rt_solution.systemConfig.runServerIP[3],
+	//     this->rt_solution.systemConfig.runServerPort,
+	//     this->rt_solution.systemConfig.backupServerIP[0],
+	//     this->rt_solution.systemConfig.backupServerIP[1],
+	//     this->rt_solution.systemConfig.backupServerIP[2],
+	//     this->rt_solution.systemConfig.backupServerIP[3],
+	//     this->rt_solution.systemConfig.backupServerPort);
+
     // AI生成注释: 检查是否为出厂默认配置
     if (nvm->isFactoryDefault())
 	{
 	// AI生成注释: 记录使用出厂默认配置的日志
-	logInfo("solution nvm factory default..");
+	logInfo("例程: NVM恢复出厂默认");
 	// AI生成注释: 恢复到出厂默认配置
 	nvm->restoreDefault();
 	// AI生成注释: 如果配置为生成唯一索引，则基于芯片UID生成设备唯一标识
@@ -282,6 +429,29 @@ Solution::Solution()
 	}
 
     /*
+     * 升级扩字段/非法组合：sanitize locate_switch 后写回
+     * （出厂值来自 PROD_CFG_DEFAULT_LOCATE_*；已落盘合法值不改）
+     */
+    {
+    const uint8_t sanitized =
+	    locate_switch_normalize(this->rt_solution.locate_switch);
+    if (sanitized != this->rt_solution.locate_switch)
+	{
+	logInfo("定位开关: 上电校正 0x%02X -> 0x%02X",
+		(unsigned) this->rt_solution.locate_switch,
+		(unsigned) sanitized);
+	this->rt_solution.locate_switch = sanitized;
+	nvm->save();
+	}
+    logInfo("定位开关: 0x%02X GNSS=%u AGNSS=%u LBS=%u (出厂默认=0x%02X)",
+	    (unsigned) this->rt_solution.locate_switch,
+	    locate_gnss_on(this->rt_solution.locate_switch) ? 1u : 0u,
+	    locate_agnss_on(this->rt_solution.locate_switch) ? 1u : 0u,
+	    locate_lbs_on(this->rt_solution.locate_switch) ? 1u : 0u,
+	    (unsigned) locate_switch_factory_default());
+    }
+
+    /*
      * 解决方案任务启动
      * 模式启动不同任务
      */
@@ -291,13 +461,14 @@ Solution::Solution()
 	{
     // AI生成注释: 工作模式 - 创建工作例程线程，具备完整功能
     case solution_mode_e::wm_work:
+	/* report/AGNSS/事件处理较重，512 易栈溢出 SoftReset */
 	xTaskCreate(Solution::solution_work_routine_thread, "solution_work",
-		512, this, osPriorityNormal, &solution_thread_handle);
+		1024, this, osPriorityNormal, &solution_thread_handle);
 	break;
     // AI生成注释: 空闲模式 - 创建空闲例程线程，功能受限以节省电能
     case solution_mode_e::wm_idle:
 	xTaskCreate(Solution::solution_idle_routine_thread, "solution_idle",
-		512, this, osPriorityNormal, &solution_thread_handle);
+		768, this, osPriorityNormal, &solution_thread_handle);
 	break;
     // AI生成注释: 默认情况（包括工厂模式）- 创建工厂测试例程线程
     default:
@@ -308,7 +479,7 @@ Solution::Solution()
     configASSERT(solution_thread_handle != NULL);
 
     // AI生成注释: 记录启动的例程模式日志，使用枚举名称转换为字符串
-    logInfo("routine started: %s..", enum_name(rt_solution.mode).data());
+    logInfo("例程: 已启动 %s", enum_name(rt_solution.mode).data());
 
     }
 
@@ -319,9 +490,76 @@ Solution::Solution()
  * 2. 组装协议数据包，包含设备状态、位置、时间等信息
  * 3. 计算CRC校验值并发送数据包到服务器
  * 4. 清除震动检测标志位，记录关键信息到日志
+ * 5. 发送成功后清除定位状态标志位（上报后置否），见文件头部设计说明
  */
+/**
+ * @brief 分行打印原始 hex，避免单次撑爆 RTT/LOG 缓冲
+ * @param tag  行前缀，如 "TX hex" / "RX hex"
+ * @param raw  缓冲区
+ * @param len  字节数
+ */
+static void log_hex_dump(const char *tag, const uint8_t *raw, unsigned len)
+    {
+    char line[80];
+    unsigned pos = 0;
+    line[0] = '\0';
+    for (unsigned i = 0; i < len; i++)
+	{
+	if (pos + 4 >= sizeof(line))
+	    {
+	    logInfo("%s: %s", tag, line);
+	    pos = 0;
+	    line[0] = '\0';
+	    }
+	pos += (unsigned) snprintf(line + pos, sizeof(line) - pos, "%02X ",
+		raw[i]);
+	}
+    if (pos > 0)
+	{
+	logInfo("%s: %s", tag, line);
+	}
+    }
+
+/**
+ * @brief 打印上报整包：包头字段、数据域、CRC，以及完整原始 hex
+ */
+static void log_report_packet(const pb_packReport *pkt)
+    {
+    const uint8_t *raw = (const uint8_t*) pkt;
+    const unsigned total = sizeof(pb_packReport);
+    /* 坐标用 1e-4 度整数，避免 %f 撑爆任务栈 */
+    logInfo(
+	    "上报字段: 时间=%lu 坐标_e4=[%ld,%ld] 状态=0x%02X 加速度=[%d,%d,%d] 倾角=%d 电压=%u 温度=%d CSQ=%u 卫星=%u",
+	    (unsigned long) pkt->body.report.time,
+	    (long) (pkt->body.report.geo[ID_LONGITUDE] * 10000.0f),
+	    (long) (pkt->body.report.geo[ID_LATITUDE] * 10000.0f),
+	    pkt->body.report.status, pkt->body.report.acc[ID_AXIS_X],
+	    pkt->body.report.acc[ID_AXIS_Y], pkt->body.report.acc[ID_AXIS_Z],
+	    pkt->body.report.angle, pkt->body.report.vbat, pkt->body.report.temp,
+	    pkt->body.report.csq, pkt->body.report.sats);
+
+    log_hex_dump("上报hex", raw, total);
+    }
+
+/**
+ * @brief 打印从模组读到的原始收包（长度 + hex），便于对照 +RECEIVE
+ */
+static void log_rx_raw(const uint8_t *raw, uint16_t len)
+    {
+    logInfo("收包原始 %u字节", (unsigned) len);
+    if (len > 0)
+	{
+	log_hex_dump("收包hex", raw, len);
+	}
+    }
+
 void Solution::report(void)
     {
+    if (util_agnss_rx_is_active())
+	{
+	logInfo("上报: AGNSS进行中, 跳过");
+	return;
+	}
 
     // AI生成注释: 创建上报数据包结构体
     pb_packReport rsps;
@@ -332,7 +570,7 @@ void Solution::report(void)
 
     // AI生成注释: 清除震动检测标志位，防止重复上报
     util_sc7a20_clear_vibration_flag();
-
+	
     // AI生成注释: 设置数据包头部的设备编码信息
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     // AI生成注释: 设置数据长度为报告结构体大小
@@ -350,31 +588,33 @@ void Solution::report(void)
     // AI生成注释: 设置地理位置坐标（纬度）
     rsps.body.report.geo[ID_LATITUDE] = util_atgm332d_get_status().latitude; //测试地理位置;
     // AI生成注释: 生成状态字节，包含工作模式、唤醒源、震动状态、倾斜状态、定位状态等信息
+    /* geoStat：本周期 GNSS fix 或本周期 LBS 成功（对齐 Slope fill_for_report） */
     rsps.body.report.status = helper_status_byte_maker(this->rt_solution.mode,
 	    util_lowpower_get_wake_source(), sensor.vibration_occured,
-	    sensor.leaned, util_atgm332d_get_status().position_fixed);
+	    sensor.leaned, util_atgm332d_geo_valid_for_report());
     // AI生成注释: 设置温度值（转换为8位有符号整数）
     rsps.body.report.temp = (int8_t) analog.temperture;
     // AI生成注释: 设置RTC时间戳
     rsps.body.report.time = (uint32_t) util_lowpower_get_rtc();
     // AI生成注释: 设置电池电压（转换为0.1V为单位的8位整数）
     rsps.body.report.vbat = (uint8_t) (analog.vbat * 10.0f);
+    // AI生成注释: 更新4G模块信号强度（同步获取）
+    int csq_now = air->getCsq();
     // AI生成注释: 设置4G模块信号强度
-    rsps.body.report.csq = air->status.csq;
+    rsps.body.report.csq = (csq_now < 0) ? 0 : (uint8_t) csq_now;
+    // AI生成注释: 设置用于定位的卫星数量（来自GGA的numSv，表示定位质量）
+    rsps.body.report.sats = util_atgm332d_get_status().sats;
     // AI生成注释: 计算数据包的CRC校验值
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
 
-    /*log some critical information: accel data, angle, status byte, temp, time, csq*/
-    // AI生成注释: 记录关键信息到日志：倾斜角度、温度、时间戳
-    logInfo("angle: %d, temp: %d, time: %ld", rsps.body.report.angle,
-	    rsps.body.report.temp, rsps.body.report.time);
-    // AI生成注释: 记录地理坐标和电池电压信息到日志
-    logInfo("geo: [%f,%f], vbat: %d ", rsps.body.report.geo[ID_LONGITUDE],
-	    rsps.body.report.geo[ID_LATITUDE], rsps.body.report.vbat);
+    log_report_packet(&rsps);
 
     // AI生成注释: 发送数据包到服务器
     send_message((uint8_t*) &rsps, sizeof(pb_packReport));
+
+    // 上报完成后将定位状态标志位置否，使下一帧仅在有新 RMC 时才标为“新定位数据”
+    util_atgm332d_clear_fix_flag();
     }
 
 /**
@@ -389,7 +629,7 @@ void Solution::restart(void)
     {
 //	$todo simply reset chip
     // AI生成注释: 记录芯片重启日志
-    logInfo("chip restart..");
+    logInfo("芯片复位重启");
     // AI生成注释: 延迟50毫秒，确保日志输出完成
     vTaskDelay(pdMS_TO_TICKS(50));
     /*$notice 重启时，写入一次flash*/
@@ -411,13 +651,10 @@ void Solution::refresh_server(void)
     }
 
 /**
- * AI生成注释: 刷新设备超时定时器函数
- * 功能说明:
- * 重置设备超时定时器，用于延长设备活动时间防止意外休眠
+ * @brief 重置设备休眠倒计时（硬计时策略下收包不再调用，避免续命）
  */
 void Solution::refresh_device(void)
     {
-    // AI生成注释: 重置设备超时定时器，延长设备活动时间
     xTimerReset(device_timeout_timer, portMAX_DELAY);
     }
 
@@ -426,30 +663,24 @@ void Solution::refresh_device(void)
  * 功能说明:
  * 1. 记录震动检测日志
  * 2. 刷新服务器响应超时定时器
- * 3. 立即上报设备状态到服务器
- * 4. 如果处于工作模式，激活GNSS定位系统
+ * 3. 如果处于工作模式，激活GNSS定位系统
+ * 4. 立即上报设备状态到服务器
  */
 void Solution::event_action_vibration(void)
     {
-    /*震动发生后，刷新服务器响应超时定时器*/
-    // AI生成注释: 记录检测到震动的日志
-    logInfo("vibration detected..");
-    // AI生成注释: 刷新服务器响应超时定时器，延长等待时间
+    logInfo("震动事件: 收到");
     xTimerReset(server_timeout_timer, portMAX_DELAY);
-    // AI生成注释: 立即上报当前设备状态到服务器
+    /* 对齐 Slope：先 report，再启定位/LBS 会话（首包不含本周期新 LBS） */
+    logInfo("震动事件: 立即上报");
     this->report();
-    /*
-     * activate bd system if the running mode is "work"
-     * 		if the mode is idle or factory, position
-     * 		update will not work for saving power
-     */
-    // AI生成注释: 判断是否为工作模式，只有工作模式才启动定位功能以节省电能
     if (rt_solution.mode == solution_mode_e::wm_work)
 	{
-	// AI生成注释: 记录开始定位的日志
-	logInfo("positioning..");
-	// AI生成注释: 激活GNSS定位模块，参数10表示激活时间或尝试次数
-	util_atgm332d_activate(10);
+	logInfo("震动事件: 工作模式, 启动定位(允许LBS)");
+	this->start_locate(true);
+	}
+    else
+	{
+	logInfo("震动事件: 非工作模式, 跳过定位");
 	}
     }
 
@@ -484,6 +715,68 @@ void Solution::event_action_message(void)
 
     // AI生成注释: 从通信模块读取消息，最大64字节
     read_size = read_message(message, 64);
+    /* 先打原始长度与 hex（含 11B 短应答），再走心跳/协议解析 */
+    log_rx_raw(message, read_size);
+
+    // AI生成注释: 检查是否包含心跳包标识 "OK"（无功能码格式：FBFBFB + code + OK + CRC）
+	if (read_size >= 11)
+	{
+	// AI生成注释: 查找心跳包起始标识符 FBFBFB
+	uint8_t *hb_ptr = message;
+	while (hb_ptr < message + read_size - 8)
+		{
+		if (hb_ptr[0] == 0xFB && hb_ptr[1] == 0xFB
+			&& hb_ptr[2] == 0xFB)
+		{
+		// AI生成注释: 检查界桩编号是否匹配（4字节：major+minor+index）
+		pb_code *hb_code = (pb_code*) (hb_ptr + 3);
+		if (hb_code->major
+			== this->rt_solution.systemConfig.code.major
+			&& hb_code->minor
+			== this->rt_solution.systemConfig.code.minor
+			&& hb_code->index
+			== this->rt_solution.systemConfig.code.index)
+			{
+			// AI生成注释: 检查是否是 "OK" 标记
+			if (hb_ptr[7] == 'O' && hb_ptr[8] == 'K')
+			{
+			// AI生成注释: 验证CRC校验（从code到OK，共6字节）
+			uint16_t hb_target_crc =
+				(hb_ptr[10] << 8) | hb_ptr[9];
+			uint16_t hb_calc_crc = HAL_CRC_Calculate(&hcrc,
+				(uint32_t*) (hb_ptr + 3), 6);
+			if (hb_calc_crc == hb_target_crc)
+				{
+				/* AGNSS 期间忽略 OK 进睡，避免打断 link2（对齐 Slope） */
+				if (util_agnss_rx_is_active())
+				{
+				logInfo("心跳已收到, AGNSS进行中忽略休眠");
+				vPortFree(message);
+				return;
+				}
+				if (util_lowpower_get_wake_source()
+				!= util_lowpower_wake_source_e::pin)
+				{
+				logInfo(
+					"心跳已收到, 进入休眠");
+				vPortFree(message);
+				this->message_sleep();
+				return;
+				}
+			else
+				{
+				logInfo(
+					"心跳已收到, 震动唤醒中忽略休眠");
+				vPortFree(message);
+				return;
+				}
+				}
+			}
+			}
+		}
+		hb_ptr++;
+		}
+	}
 
     // AI生成注释: 检查读取的数据是否足够包含协议头部
     if (read_size < sizeof(pb_header))
@@ -523,13 +816,17 @@ void Solution::event_action_message(void)
 		    param_ptr = ((uint8_t*) possible_header)
 			    + sizeof(pb_header);
 		    // AI生成注释: 记录消息确认日志
-		    logInfo("message confirmed..");
-		    // AI生成注释: 刷新服务器和设备超时定时器
+		    logInfo("消息: 已确认");
+		    /* 仅刷新上报超时；设备休眠为唤醒后硬计时，收包不续命 */
 		    this->refresh_server();
-		    this->refresh_device();
-		    // AI生成注释: 记录收到的消息功能码日志
-		    logInfo("message received: %s",
-			    enum_name((e_pb_func )(possible_header->function)).data());
+		    /* 功能码同时打数值，避免 enum 名为空时与下一行 I(0) 粘成 "received: 0" */
+		    {
+		    auto fname = enum_name((e_pb_func) possible_header->function);
+		    logInfo("消息: 已收到 功能码=%u 数据长=%u 名称=%s",
+			    (unsigned) possible_header->function,
+			    (unsigned) possible_header->dataLen,
+			    fname.empty() ? "?" : fname.data());
+		    }
 		    // AI生成注释: 根据功能码分发到相应的处理函数
 		    switch (possible_header->function)
 			{
@@ -568,6 +865,23 @@ void Solution::event_action_message(void)
 			this->message_change_execute_mode(
 				(solution_mode_e*) param_ptr);
 			break;
+		    /* 服务器查询固件版本（func=17） */
+		    case e_pb_func::down_uploadFirmwareVersion:
+			this->message_upload_firmware_version();
+			break;
+		    case e_pb_func::down_configLocateGeo:
+			this->message_config_locate_geo(
+				possible_header->dataLen == sizeof(pb_locateGeo) ?
+					(pb_locateGeo*) param_ptr : nullptr);
+			break;
+		    case e_pb_func::down_configLocateSwitch:
+			this->message_config_locate_switch(
+				possible_header->dataLen == 1 ?
+					(uint8_t*) param_ptr : nullptr);
+			break;
+		    case e_pb_func::down_uploadLocateSwitch:
+			this->message_upload_locate_switch();
+			break;
 			}
 		    // AI生成注释: 消息处理完成，释放内存并返回
 		    vPortFree(message);
@@ -581,7 +895,7 @@ void Solution::event_action_message(void)
     // AI生成注释: 未找到有效消息，释放内存
     vPortFree(message);
     // AI生成注释: 记录无效消息警告日志
-    logWarning("bad message..");
+    logWarning("消息: 格式错误");
     return;
     }
 
@@ -643,42 +957,37 @@ void Solution::message_change_run_parameters(pb_runningConfig *params)
     // AI生成注释: 获取当前模拟信号配置
     util_analog_config_s analog_config = util_analog_get_config();
 
-    // AI生成注释: 更新运行配置参数
-    rt_solution.runningConfig = *params;
-//	修改Solution相关配置
-    // AI生成注释: 修改服务器响应超时定时器周期，单位转换为毫秒，立即生效
-    xTimerChangePeriod(server_timeout_timer,
-	    pdMS_TO_TICKS(rt_solution.runningConfig.t2_serverRsps_timeout_sec * 1000),
-	    portMAX_DELAY); //    修改服务器响应超时定时器,单位为秒,立即生效
-    // AI生成注释: 修改设备超时定时器，根据定位状态选择不同的超时时间
-    xTimerChangePeriod(device_timeout_timer,
-	    pdMS_TO_TICKS( util_atgm332d_get_status().position_fixed?rt_solution.runningConfig.t4_gnssGood_sleep_sec * 1000:rt_solution.runningConfig.t3_gnssSearch_sleep_sec * 1000),
-	    portMAX_DELAY); //    修改设备超时定时器,单位为分钟,立即生效
-
-//	修改传感器配置:震动消抖
-    // AI生成注释: 更新传感器震动检测的冷却时间（防抖时间）
-    sensor_config.cool_down_timeout = params->t5_motionDetect_delay_sec;
-    // AI生成注释: 应用传感器配置
-    util_sc7a20_set_config(sensor_config);
-//	修改模拟信号配置:电池报警阈值
-    // AI生成注释: 更新电池低电压报警阈值，从0.1V单位转换为V单位
-    analog_config.low_battery_threshold = params->n1_vbatAlarm_threshold_volt
-	    / 10.0f;
-    // AI生成注释: 应用模拟信号配置
-    util_analog_set_config(analog_config);
-
-    // AI生成注释: 保存配置到NVM
-    nvm->save();
-
     // AI生成注释: 设置响应数据包头部信息
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     rsps.body.header.function = e_pb_func::up_runningConfigResult;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
 
-    // AI生成注释: 设置响应结果，只有在配置编辑模式下才成功应用配置
-    rsps.body.cmdletOrResponse =
-	    this->rt_solution.configEditting ?
-		    (this->rt_solution.runningConfig = *params) : 0xFF;
+    if (this->rt_solution.configEditting)
+	{
+	// AI生成注释: 配置编辑模式下，应用运行配置
+	rt_solution.runningConfig = *params;
+	// AI生成注释: 修改服务器响应超时定时器周期
+	xTimerChangePeriod(server_timeout_timer,
+		pdMS_TO_TICKS(rt_solution.runningConfig.t2_serverRsps_timeout_sec * 1000),
+		portMAX_DELAY);
+	xTimerChangePeriod(device_timeout_timer,
+		pdMS_TO_TICKS(util_atgm332d_get_status().position_fixed ?
+			rt_solution.runningConfig.t4_gnssGood_sleep_sec * 1000 :
+			rt_solution.runningConfig.t3_gnssSearch_sleep_sec * 1000),
+		portMAX_DELAY);
+	/* t5 单位秒 → 加计冷却毫秒（落实 PRODUCT_CONFIG / 协议消抖） */
+	sensor_config.cool_down_timeout =
+		(uint32_t) params->t5_motionDetect_delay_sec * 1000u;
+	util_sc7a20_set_config(sensor_config);
+	analog_config.low_battery_threshold = params->n1_vbatAlarm_threshold_volt / 10.0f;
+	util_analog_set_config(analog_config);
+	nvm->save();
+	rsps.body.cmdletOrResponse = 0; /* 0: 全部设定成功 */
+	}
+    else
+	{
+	rsps.body.cmdletOrResponse = 255; /* 255: 全部设定失败 */
+	}
     // AI生成注释: 计算响应数据包的CRC校验值
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
@@ -718,6 +1027,7 @@ void Solution::message_sleep(void)
 //	save all configurations before sleep
     // AI生成注释: 休眠前保存所有配置到NVM
     nvm->save();
+    util_atgm332d_nvm_flush();
 //	sleep
     // AI生成注释: 获取当前低功耗配置
     auto lpconfig = util_lowpower_get_config();
@@ -863,6 +1173,308 @@ void Solution::message_upload_sys_parameters(void)
     }
 
 /**
+ * @brief 应答服务器固件版本查询（down_uploadFirmwareVersion=17）
+ * @note  上行功能码 16，数据域 year/month/revision 来自 PRODUCT_CONFIG
+ */
+void Solution::message_upload_firmware_version(void)
+    {
+    pb_packFirmwareVersion rsps;
+
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_firmwareVersionUpload;
+    rsps.body.header.dataLen = sizeof(pb_firmwareVersion);
+    rsps.body.firmwareVersion.year = PROD_FW_VER_YEAR;
+    rsps.body.firmwareVersion.month = PROD_FW_VER_MONTH;
+    rsps.body.firmwareVersion.revision = PROD_FW_VER_REVISION;
+
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+
+    send_message((uint8_t*) &rsps, sizeof(pb_packFirmwareVersion));
+    logInfo("固件版本应答: %02u.%02u.%02u",
+	    (unsigned) PROD_FW_VER_YEAR, (unsigned) PROD_FW_VER_MONTH,
+	    (unsigned) PROD_FW_VER_REVISION);
+    }
+
+/** 应答写入定位信息：配置模式下写入 GNSS 缓存并落 NVM */
+void Solution::message_config_locate_geo(pb_locateGeo *geo)
+    {
+    pb_packCmdletOrResponse rsps;
+    uint8_t ok = 0;
+
+    if (this->rt_solution.configEditting && geo != nullptr)
+	{
+	if (util_atgm332d_set_manual_geo(geo->geo[ID_LONGITUDE],
+		geo->geo[ID_LATITUDE]))
+	    {
+	    ok = 1;
+	    }
+	}
+
+    rsps.body.cmdletOrResponse = ok;
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_locateGeoResult;
+    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    logInfo("定位坐标写入应答: %u", (unsigned) ok);
+    }
+
+/**
+ * @brief 应答修改定位开关（上行功能码 20）
+ * @note  结果字节：1=成功；0=未进配置模式/参数缺失；2=非法(开AGNSS未开GNSS)
+ */
+void Solution::message_config_locate_switch(uint8_t *value)
+    {
+    pb_packCmdletOrResponse rsps;
+    uint8_t result = 0;
+
+    if (this->rt_solution.configEditting && value != nullptr)
+	{
+	const uint8_t raw = (uint8_t) (*value & kLocateSwitchMask);
+	/* 先判非法组合再 normalize，避免把「仅 AGNSS」静默改成全关 */
+	if (!locate_switch_is_valid(raw))
+	    {
+	    result = 2; /* 开 AGNSS 须同时开 GNSS */
+	    logWarning("定位开关: 拒绝 0x%02X (开AGNSS须开GNSS), 应答=2",
+		    (unsigned) raw);
+	    }
+	else
+	    {
+	    this->rt_solution.locate_switch = locate_switch_normalize(raw);
+	    util_atgm332d_deactivate();
+	    nvm->save();
+	    result = 1;
+	    logInfo("定位开关: 已更新 0x%02X",
+		    (unsigned) this->rt_solution.locate_switch);
+	    }
+	}
+
+    rsps.body.cmdletOrResponse = result;
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_locateSwitchResult;
+    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    logInfo("定位开关: 应答结果=%u", (unsigned) result);
+    }
+
+/** 上报当前定位开关（无需配置模式） */
+void Solution::message_upload_locate_switch(void)
+    {
+    pb_packCmdletOrResponse rsps;
+
+    rsps.body.cmdletOrResponse = locate_switch_normalize(
+	    this->rt_solution.locate_switch);
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_locateSwitchUpload;
+    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    logInfo("定位开关上传: 0x%02X",
+	    (unsigned) rsps.body.cmdletOrResponse);
+    }
+
+/* LBS 会话状态（对齐 Slope sys_gnss：事件循环执行，不堵在 start_locate） */
+static volatile bool s_lbs_due = false;
+static bool s_lbs_active = false;
+static uint8_t s_lbs_attempts = 0;
+
+void Solution::lbs_retry_timer_callback(TimerHandle_t xTimer)
+    {
+    (void) xTimer;
+    s_lbs_due = true;
+    logInfo("LBS 重试计时到点");
+    }
+
+static void lbs_session_stop(void)
+    {
+    s_lbs_active = false;
+    s_lbs_due = false;
+    }
+
+void Solution::lbs_schedule_retry(void)
+    {
+    if (this->lbs_retry_timer == nullptr)
+	{
+	this->lbs_retry_timer = xTimerCreate("lbs_retry",
+		pdMS_TO_TICKS(PROD_CFG_LBS_RETRY_INTERVAL_SEC * 1000u),
+		pdFALSE, this, Solution::lbs_retry_timer_callback);
+	}
+    if (this->lbs_retry_timer == nullptr)
+	{
+	return;
+	}
+    xTimerChangePeriod(this->lbs_retry_timer,
+	    pdMS_TO_TICKS(PROD_CFG_LBS_RETRY_INTERVAL_SEC * 1000u), 0);
+    xTimerStart(this->lbs_retry_timer, 0);
+    logInfo("LBS %us 后重试 (已查询 %u/%u)",
+	    (unsigned) PROD_CFG_LBS_RETRY_INTERVAL_SEC,
+	    (unsigned) s_lbs_attempts,
+	    (unsigned) PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE);
+    }
+
+void Solution::lbs_session_start(void)
+    {
+    if (util_atgm332d_get_status().position_fixed)
+	{
+	logInfo("LBS跳过: 北斗已定位");
+	return;
+	}
+    if (!util_atgm332d_lbs_interval_elapsed())
+	{
+	return;
+	}
+    s_lbs_attempts = 0;
+    s_lbs_active = true;
+    s_lbs_due = true;
+    logInfo("LBS 会话已启动（满 4h 后本唤醒最多 %u 次查询）",
+	    (unsigned) PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE);
+    }
+
+void Solution::lbs_process_due(void)
+    {
+    if (!s_lbs_due || !s_lbs_active)
+	{
+	return;
+	}
+    s_lbs_due = false;
+
+    if (util_atgm332d_get_status().position_fixed)
+	{
+	lbs_session_stop();
+	return;
+	}
+
+    if (util_agnss_rx_is_active())
+	{
+	this->lbs_schedule_retry();
+	return;
+	}
+
+    if (s_lbs_attempts >= PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE)
+	{
+	lbs_session_stop();
+	logInfo("LBS：本唤醒结束 (attempts=%u/%u)",
+		(unsigned) s_lbs_attempts,
+		(unsigned) PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE);
+	return;
+	}
+
+    if (this->air == nullptr)
+	{
+	lbs_session_stop();
+	return;
+	}
+
+    const int csq = this->air->getCsq();
+    if (csq < 0 || csq == 99 || csq < (int) PROD_CFG_LBS_MIN_CSQ)
+	{
+    logWarning("LBS跳过: CSQ=%d", csq);
+	this->lbs_schedule_retry();
+	return;
+	}
+
+    logInfo("定位: 查询LBS");
+    AIR780EP::LbsResult lbs{};
+    const bool got = this->air->query_lbs(&lbs, PROD_CFG_LBS_QUERY_TIMEOUT_MS);
+    ++s_lbs_attempts;
+    util_atgm332d_lbs_note_query_sent();
+
+    if (util_atgm332d_get_status().position_fixed)
+	{
+	lbs_session_stop();
+	return;
+	}
+
+    if (got && lbs.ok)
+	{
+	logInfo("定位: LBS成功, 写入坐标");
+	(void) util_atgm332d_apply_lbs_geo(lbs.longitude, lbs.latitude);
+	lbs_session_stop();
+	logInfo("LBS：本唤醒成功，停止会话 (attempts=%u)",
+		(unsigned) s_lbs_attempts);
+	return;
+	}
+
+    logWarning("LBS查询失败 attempt=%u/%u", (unsigned) s_lbs_attempts,
+	    (unsigned) PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE);
+
+    if (s_lbs_attempts < PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE)
+	{
+	this->lbs_schedule_retry();
+	return;
+	}
+
+    lbs_session_stop();
+    logInfo("LBS：本唤醒结束 (attempts=%u/%u)", (unsigned) s_lbs_attempts,
+	    (unsigned) PROD_CFG_LBS_MAX_ATTEMPTS_PER_WAKE);
+    }
+
+/**
+ * @brief 按 locate_switch 启动定位
+ * @param allow_lbs true=允许本路径启 LBS 会话（引脚/震动）
+ */
+void Solution::start_locate(bool allow_lbs)
+    {
+    const uint8_t sw = locate_switch_normalize(this->rt_solution.locate_switch);
+    const bool want_gnss = locate_gnss_on(sw);
+    const bool want_agnss = locate_agnss_on(sw);
+    /* LBS: 需开关bit2 且本路径允许(引脚/震动)；真正 AT 在 lbs_process_due */
+    const bool want_lbs = allow_lbs && locate_lbs_on(sw);
+
+    logInfo("定位: 开关=0x%02X GNSS=%u AGNSS=%u LBS=%u 允许LBS=%u",
+	    (unsigned) sw, want_gnss ? 1u : 0u, want_agnss ? 1u : 0u,
+	    locate_lbs_on(sw) ? 1u : 0u, allow_lbs ? 1u : 0u);
+
+    if (!want_gnss && !want_lbs)
+	{
+	logInfo("定位: 跳过(无需GNSS/LBS)");
+	return;
+	}
+
+    if (want_gnss)
+	{
+	logInfo("定位: 开启北斗");
+	util_atgm332d_activate(10);
+	vTaskDelay(pdMS_TO_TICKS(PROD_CONFIG_AGNSS_PWR_SETTLE_MS));
+	logInfo("定位: 北斗上电稳定结束");
+	if (want_agnss && this->air != nullptr
+		&& !util_agnss_done_this_wake())
+	    {
+	    logInfo("定位: 拉取AGNSS");
+	    (void) util_agnss_fetch_and_inject_once(this->air);
+	    }
+	else if (want_agnss && util_agnss_done_this_wake())
+	    {
+	    logInfo("定位: AGNSS本唤醒已做过, 跳过");
+	    }
+	else if (want_agnss)
+	    {
+	    logInfo("定位: AGNSS跳过(无4G实例)");
+	    }
+	}
+
+    if (!want_lbs)
+	{
+	logInfo("定位: LBS开关关或本路径不允许, 跳过");
+	}
+    else if (want_lbs && util_atgm332d_get_status().position_fixed)
+	{
+	logInfo("定位: LBS跳过(北斗已定位)");
+	}
+    else
+	{
+	/* 对齐 Slope：AGNSS 后只启会话，查询放到事件循环，避免与首包/t2 抢时序 */
+	this->lbs_session_start();
+	}
+    logInfo("定位: 流程结束");
+    }
+
+/**
  * AI生成注释: 处理服务器修改系统配置的消息
  * 功能说明:
  * 1. 验证配置编辑权限并更新系统配置
@@ -875,36 +1487,30 @@ void Solution::message_change_sys_parameters(pb_systemConfig *params)
     // AI生成注释: 创建命令响应数据包
     pb_packCmdletOrResponse rsps;
 
-    // AI生成注释: 只有在配置编辑模式下才允许修改系统配置
-    rsps.body.cmdletOrResponse =
-	    this->rt_solution.configEditting ? (this->rt_solution.systemConfig =
-						       *params) :
-					       0xFF;
-
-    // AI生成注释: 设置4G模块的主服务器连接参数
-    air->setServer(params->runServerIP, params->runServerPort,
-	    AIR780EP::air780_server_t::server_main);
-    // AI生成注释: 设置4G模块的备用服务器连接参数
-    air->setServer(params->backupServerIP, params->backupServerPort,
-	    AIR780EP::air780_server_t::server_aux);
-
-//	修改传感器配置:倒置角度范围，震动检测阈值
-    // AI生成注释: 获取当前传感器配置
-    util_sc7a20_config_s sensor_config = util_sc7a20_get_config();
-    // AI生成注释: 更新传感器倾斜检测的角度范围
-    sensor_config.range = this->rt_solution.systemConfig.sensorReverseRange;
-    // AI生成注释: 更新传感器震动检测阈值（以16mg为单位的LSB值）
-    sensor_config.acc_thres16mg_lsb = params->sensorVibrationThreshold;
-    // AI生成注释: 应用传感器配置
-    util_sc7a20_set_config(sensor_config);
-
-    // AI生成注释: 保存配置到NVM
-    nvm->save();
-
     // AI生成注释: 设置响应数据包头部信息
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     rsps.body.header.function = e_pb_func::up_systemConfigResult;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+
+    if (this->rt_solution.configEditting)
+	{
+	// AI生成注释: 配置编辑模式下，应用系统配置
+	this->rt_solution.systemConfig = *params;
+	air->setServer(params->runServerIP, params->runServerPort,
+		AIR780EP::air780_server_t::server_main);
+	air->setServer(params->backupServerIP, params->backupServerPort,
+		AIR780EP::air780_server_t::server_aux);
+	util_sc7a20_config_s sensor_config = util_sc7a20_get_config();
+	sensor_config.range = this->rt_solution.systemConfig.sensorReverseRange;
+	sensor_config.acc_thres16mg_lsb = params->sensorVibrationThreshold;
+	util_sc7a20_set_config(sensor_config);
+	nvm->save();
+	rsps.body.cmdletOrResponse = 0; /* 0: 全部设定成功 */
+	}
+    else
+	{
+	rsps.body.cmdletOrResponse = 255; /* 255: 全部设定失败 */
+	}
     // AI生成注释: 计算响应数据包的CRC校验值
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
@@ -1087,43 +1693,58 @@ int Solution::read_message(void *dest, uint16_t len)
  */
 void Solution::server_timeout_timer_callback(TimerHandle_t xTimer)
     {
-    // AI生成注释: 从定时器ID获取Solution实例指针
-    auto *pthis = (Solution*) pvTimerGetTimerID(xTimer);
-    // AI生成注释: 主动上报设备状态到服务器
-    pthis->report();
+    (void) xTimer;
+    /* 只投递事件：report 含 AT/日志，放 Timer 任务会栈溢出且堵住喂狗定时器 */
+    if (util_agnss_rx_is_active())
+	{
+	return;
+	}
+    util_events_generate(util_event_code_t::server_report_due);
     }
 
 /**
- * AI生成注释: 设备超时定时器回调函数
- * 功能说明:
- * 1. 当设备活动超时时自动触发
- * 2. 配置低功耗参数并进入休眠模式
- * 3. 设置下次唤醒时间为网络良好时的间隔
- * 参数:
- * @param xTimer: 触发的定时器句柄
+ * 设备硬计时休眠：自 timers_create 起算，到期进入 standby（收包不延长）
  */
 void Solution::device_timeout_timer_callback(TimerHandle_t xTimer)
     {
-    // AI生成注释: 从定时器ID获取Solution实例指针
     auto *pthis = (Solution*) pvTimerGetTimerID(xTimer);
-    /*
-     * $todo 休眠时间一定是netgood，因为这个定时器是在连接网络之后创建的
-     * 		    如果网络连接失败，在创建这个定时器之前就会进入休眠
-     */
-    // AI生成注释: 计算休眠时间，使用网络良好时的唤醒间隔（分钟转秒）
-    uint32_t sleep_time = pthis->rt_solution.runningConfig.t0_netGood_wakeup_min
+    if (util_agnss_rx_is_active())
+	{
+	/* 单次定时器：AGNSS 中错过则再开一轮，避免永远不睡 */
+	xTimerStart(xTimer, 0);
+	return;
+	}
+    (void) pthis;
+    util_events_generate(util_event_code_t::device_sleep_due);
+    }
+
+/** 工作线程执行：服务器超时上报 */
+void Solution::event_action_server_report(void)
+    {
+    if (util_agnss_rx_is_active())
+	{
+	return;
+	}
+    this->report();
+    }
+
+/** 工作线程执行：在线超时进休眠 */
+void Solution::event_action_device_sleep(void)
+    {
+    if (util_agnss_rx_is_active())
+	{
+	return;
+	}
+    logInfo("定时器: 设备在线超时, 进入休眠");
+    lbs_session_stop();
+    util_atgm332d_nvm_flush();
+    uint32_t sleep_time = this->rt_solution.runningConfig.t0_netGood_wakeup_min
 	    * 60;
-    // AI生成注释: 获取当前低功耗配置
     auto lpconfig = util_lowpower_get_config();
-    // AI生成注释: 启用唤醒引脚，允许外部震动唤醒
     lpconfig.wake_pin_enable = true;
-    // AI生成注释: 设置请求的唤醒周期
     lpconfig.requested_wakeup_period = sleep_time;
-    // AI生成注释: 设置剩余唤醒时间
     lpconfig.wakeup_remain = sleep_time;
-    // AI生成注释: 应用低功耗配置
     util_lowpower_set_config(lpconfig);
-    // AI生成注释: 进入待机休眠模式
     util_lowpower_standby();
     }
 
@@ -1161,22 +1782,18 @@ void Solution::event_process(void)
 	case util_event_code_t::message:
 	    this->event_action_message();
 	    break;
-	    /*
-	     * $notice 网络连接确认事件已经删除，当网络初始化（连接）后，立即report
-	     *    	然后创建超时定时器，超时则再次report
-	     * */
-
-	    /*
-	     * $notice GNSS更新事件已经删除，当振动发生过后，北斗会立即激活，然后开始刷新
-	     *     	定位信息，所以不需要GNSS更新事件，服务器如果需要定位信息，只需要等待
-	     *     	振动事件发生即可，或设计一条命令，手动激活北斗上电，然后等待北斗定位
-	     *     	刷新完成即可
-	     */
-	// AI生成注释: 默认情况 - 未知或不处理的事件
+	case util_event_code_t::server_report_due:
+	    this->event_action_server_report();
+	    break;
+	case util_event_code_t::device_sleep_due:
+	    this->event_action_device_sleep();
+	    break;
 	default:
 	    break;
 	    }
 	}
+    /* LBS：对齐 Slope process_lbs_due，每圈检查到期查询 */
+    this->lbs_process_due();
     }
 
 /**
@@ -1190,7 +1807,7 @@ void Solution::event_process(void)
 void Solution::setup_network(void)
     {
     // AI生成注释: 记录网络设置开始日志
-    logInfo("Setting up network.");
+    logInfo("网络: 开始配置");
     // AI生成注释: 获取当前低功耗配置，用于失败时的休眠设置
     auto lpconfig = util_lowpower_get_config();
     // AI生成注释: 启动4G通信模块电源
@@ -1200,7 +1817,7 @@ void Solution::setup_network(void)
 	{
 	/*等待LTE附着，LTE附着超过10秒说明附近没有基站或信号微弱*/
 	// AI生成注释: 记录LTE附着失败警告
-	logWarning("LTE not attached!");
+	logWarning("网络: LTE未附着!");
 	// AI生成注释: 配置低功耗模式，启用外部唤醒引脚
 	lpconfig.wake_pin_enable = true;
 	// AI生成注释: 设置网络不良时的唤醒间隔（分钟转秒）
@@ -1214,7 +1831,7 @@ void Solution::setup_network(void)
 	util_lowpower_standby();/*LTE附着失败，休眠*/
 	}
     // AI生成注释: 记录LTE附着成功，开始模块配置
-    logInfo("LTE attached, module configuring..");
+    logInfo("网络: LTE已附着, 配置模组中");
     // AI生成注释: 执行4G模块的初始配置
     this->air->setup();/*模块初始配置*/
     // AI生成注释: 配置主服务器连接参数（IP地址和端口）
@@ -1226,7 +1843,7 @@ void Solution::setup_network(void)
 	    this->rt_solution.systemConfig.backupServerPort,
 	    AIR780EP::air780_server_t::server_aux);/*配置备用服务器链接参数*/
     // AI生成注释: 记录主服务器和备用服务器的连接参数信息
-    logInfo("main server: %d.%d.%d.%d:%d, aux server: %d.%d.%d.%d:%d",
+    logInfo("网络: 主服 %d.%d.%d.%d:%d, 备服 %d.%d.%d.%d:%d",
 	    this->rt_solution.systemConfig.runServerIP[0],
 	    this->rt_solution.systemConfig.runServerIP[1],
 	    this->rt_solution.systemConfig.runServerIP[2],
@@ -1249,9 +1866,9 @@ void Solution::setup_network(void)
 		AIR780EP::air780_server_t::server_aux);
 
     // AI生成注释: 记录服务器连接结果
-    logInfo("connect to %s server: %s",
-	    this->rt_solution.connect_to_main_server ? "main" : "aux",
-	    connectReady ? "success" : "failed");
+    logInfo("网络: 连接%s服务器: %s",
+	    this->rt_solution.connect_to_main_server ? "主" : "备",
+	    connectReady ? "成功" : "失败");
 
     // AI生成注释: 如果服务器连接失败
     if (!connectReady)
@@ -1289,17 +1906,16 @@ void Solution::timers_create(void)
 			    1000
 				    * this->rt_solution.runningConfig.t2_serverRsps_timeout_sec),
 		    pdTRUE, (void*) this, server_timeout_timer_callback);
-    // AI生成注释: 创建设备活动超时定时器，周期性触发，用于设备休眠管理
+    /* 唤醒后硬计时一次，到期必睡；pdFALSE=单次，收包不 reset */
     this->device_timeout_timer = xTimerCreate(this->device_timeout_timer_name,
 	    pdMS_TO_TICKS(
 		    this->rt_solution.runningConfig.t3_gnssSearch_sleep_sec
 			    * 1000),
-	    pdTRUE, (void*) this, device_timeout_timer_callback);
+	    pdFALSE, (void*) this, device_timeout_timer_callback);
     // AI生成注释: 记录服务器响应超时倒计时时间
-    logInfo("server response timeout countdown: %d secs",
+    logInfo("定时器: 服务器响应超时倒计时 %d秒",
 	    this->rt_solution.runningConfig.t2_serverRsps_timeout_sec);
-    // AI生成注释: 记录设备休眠倒计时时间
-    logInfo("device sleep countdown: %d secs",
+    logInfo("定时器: 设备硬休眠倒计时 %d秒(收包不续期)",
 	    this->rt_solution.runningConfig.t3_gnssSearch_sleep_sec);
     // AI生成注释: 启动服务器响应超时定时器
     xTimerStart(this->server_timeout_timer, portMAX_DELAY);
@@ -1322,42 +1938,54 @@ void Solution::timers_create(void)
  */
 void Solution::solution_work_routine_thread(void *argument)
     {
-    // AI生成注释: 获取Solution实例指针
     Solution *pthis = (Solution*) argument;
+    const util_lowpower_wake_source_e wake =
+	    util_lowpower_get_wake_source();
+    logInfo("工作例程: 启动, 唤醒源=%s", enum_name(wake).data());
+    util_atgm332d_wake_session_begin();
+    lbs_session_stop();
 
-    /*----	4G启动		----*/
-    // AI生成注释: 创建4G通信模块实例，使用UART1接口
     pthis->air = new AIR780EP(&huart1);
-    // AI生成注释: 确保4G模块实例创建成功
     configASSERT(pthis->air != NULL);
-    // AI生成注释: 设置网络连接（包括LTE附着和服务器连接）
+    logInfo("工作例程: 开始联网");
     pthis->setup_network();
-    /*suspend analog to prevent further disturbance on analog signals*/
-    // AI生成注释: 暂停模拟信号采集，防止在网络通信期间产生干扰
-    util_analog_suspend(); //禁止模拟信号采集，防止干扰
-    /*清空等待网络期间发生的所有事件*/
-    // AI生成注释: 清空事件队列，忽略网络建立期间的所有事件
+    util_analog_suspend();
+    logInfo("工作例程: 清空联网期间事件");
     util_events_flush();
-    // AI生成注释: 网络连接成功后立即上传一次设备状态报告
-    pthis->report(); //连接后立即上传一次数据
 
-    /*----	定时器启动	----*/
-    // AI生成注释: 创建并启动系统定时器（服务器响应超时和设备活动超时）
-    pthis->timers_create();
+    /* 先上报再 AGNSS：避免 t2 report 与 link2 抢 AT（对齐 Slope） */
+    logInfo("工作例程: 首次上报");
+    pthis->report();
 
-    /*----	定位刷新 		----*/
-    // AI生成注释: 如果配置要求启动时更新位置信息
-    if (pthis->rt_solution.updatePositionOnStart)
+    /*
+     * Standby 引脚唤醒=整机复位：不会自动产生 vibrate 事件，
+     * 且上面 flush 会丢掉联网期间的加计事件，故此处按震动路径补定位。
+     */
+    if (wake == util_lowpower_wake_source_e::pin)
 	{
-	// AI生成注释: 激活GNSS定位模块进行位置更新（参数3表示激活时间或重试次数）
-	util_atgm332d_activate(3);
-	// AI生成注释: 清除启动更新位置标志，避免重复更新
+	logInfo("工作例程: 引脚唤醒, 按震动路径定位");
+	logInfo("工作例程: 定位开关=0x%02X",
+		(unsigned) pthis->rt_solution.locate_switch);
+	util_sc7a20_mark_vibration();
+	pthis->start_locate(true);
 	pthis->rt_solution.updatePositionOnStart = false;
-	// AI生成注释: 保存配置更新到NVM
 	pthis->nvm->save();
 	}
+    else if (pthis->rt_solution.updatePositionOnStart)
+	{
+	logInfo("工作例程: 开机刷新定位(不允许LBS)");
+	pthis->start_locate(false);
+	pthis->rt_solution.updatePositionOnStart = false;
+	pthis->nvm->save();
+	}
+    else
+	{
+	logInfo("工作例程: 本周期不主动定位");
+	}
 
-    // AI生成注释: 进入主事件处理循环，持续处理系统事件
+    pthis->timers_create();
+    logInfo("工作例程: 进入事件循环");
+
     loop: pthis->event_process();
     goto loop;
     }
@@ -1389,6 +2017,8 @@ void Solution::solution_idle_routine_thread(void *argument)
     /*创建通信模组实例*/
     // AI生成注释: 创建4G通信模块实例，使用UART1接口
     pthis->air = new AIR780EP(&huart1);
+    /* 将4G模块实例赋值给全局指针，供其他模块（如北斗定位）调用 */
+    //g_air780ep = pthis->air;
     // AI生成注释: 确保4G模块实例创建成功
     configASSERT(pthis->air != NULL);
     // AI生成注释: 设置网络连接

@@ -64,7 +64,8 @@ extern "C" void boot_thread(void *argument) {
 	 */
 
 //	__HAL_DBGMCU_FREEZE_IWDG();
-//	__util_shell_init__();
+//	__util_shell_init__();	// UART2 shell，与北斗冲突，默认改用 RTT
+	__util_rtt_log_init__();	// SEGGER RTT 调试日志（SWD，不占串口）
 	__util_events_init__();	//初始化事件队列
 	__util_lowpower_init__();	//初始化低功耗
 
@@ -85,7 +86,6 @@ extern "C" void boot_thread(void *argument) {
 //	testu->open();
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(200));
-//		testu->write((void*) "cao ni ma\r\n", 11);
 		/* USER CODE END boot_thread */
 	}
 

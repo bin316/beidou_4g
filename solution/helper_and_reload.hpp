@@ -29,7 +29,7 @@ uint8_t helper_status_byte_maker(solution_mode_e mode,
     {
     uint8_t status = 0;
 //	7		6		5		4		3		2		1		0
-//	|mode   	|wake				|vib		|lean		|tmNew		|gnssNew
+//	|mode   	|wake				|vib		|保留		|lean		|gnssNew
     switch (mode)
 	{
     case solution_mode_e::wm_factory:

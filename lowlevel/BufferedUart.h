@@ -48,7 +48,11 @@ public:
 		/*config the semephore and buffer timeout*/
 		_trigger_level,
 		/*clear the rx buffer*/
-		_flush_rx, _soft_rs485
+		_flush_rx, _soft_rs485,
+		/** 暂停 Idle-DMA 收（AGNSS/CASBIN 注入前），避免与阻塞发送打架 */
+		_rx_pause,
+		/** 恢复 Idle-DMA 收 */
+		_rx_resume
 	} io_opt_t;
 
 	typedef struct {
@@ -89,6 +93,7 @@ private:
 	size_t tx_dma_size = 0;
 
 	bool tx_busy = false;
+	volatile bool rx_paused_ = false; /**< true=注入中，停 Idle-DMA 收发 */
 	uint32_t option_sem_timeout = portMAX_DELAY;
 
 	StreamBufferHandle_t rx_stream_buffer = NULL;

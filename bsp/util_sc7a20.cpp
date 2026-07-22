@@ -25,6 +25,8 @@
 #include "timers.h"
 
 #include "utilties.h"
+#include "PRODUCT_CONFIG.h"
+#include "log.h"
 #include "NVM.h"
 NVM *sc7a20_nvm = NULL;
 
@@ -34,10 +36,14 @@ typedef struct {
 	const uint32_t magic = MAGIC_FLASH_NUMBER;
 } sc7a20_handle;
 
+/* cool_down_timeout / update_period 单位均为毫秒 */
 static volatile sc7a20_handle factory = { .config = { .leanDetectEnabled = true,
 		.leanDetectOffset = 0, .range = 15, .acc_thres16mg_lsb = 1,
-		.cool_down_timeout = 3000, .update_period = 200 }, .status = { .pitch =
-		0, .roll = 0, .lean_angle = 0, .x = 0, .y = 0, .z = 0, .leaned = false,
+		.cool_down_timeout =
+				(uint32_t) PROD_CONFIG_FACTORY_VIBRATION_DEBOUNCE_SEC
+						* 1000u,
+		.update_period = 200 }, .status = { .pitch = 0, .roll = 0,
+		.lean_angle = 0, .x = 0, .y = 0, .z = 0, .leaned = false,
 		.vibration_occured = false, .vibration_cooling = false, } };
 
 #define SC7A20_CONFIG_IIC	hi2c1
@@ -257,9 +263,10 @@ static void util_sc7a20_update_timer_callback(TimerHandle_t xTimer) {
 #define SC7A20_NOTIFY_COOLDOWN	(0x00000001<<2)
 
 static void util_sc7a20_cool_down_timer_callback(TimerHandle_t xTimer) {
+	(void) xTimer;
 	util_sc7a20_enable_interrupts();
-	xTaskNotifyFromISR(sc7a20_daemon_thread_handle, SC7A20_NOTIFY_COOLDOWN,
-			eSetBits, NULL);
+	/* 定时器回调在任务上下文，勿用 FromISR */
+	xTaskNotify(sc7a20_daemon_thread_handle, SC7A20_NOTIFY_COOLDOWN, eSetBits);
 }
 
 static void util_sc7a20_int1_isr_callback(void) {
@@ -286,6 +293,7 @@ static void util_sc7a20_daemon_thread(void *args) {
 	if (notify_value & SC7A20_NOTIFY_INT1) {
 		rt_sc7a20.status.vibration_occured = true;
 		xTimerStart(sc7a20_cool_down_timer, portMAX_DELAY);
+		logInfo("加计: INT1震动, 投递事件");
 		util_events_generate(util_event_code_t::vibrate);
 	}
 	if (notify_value & SC7A20_NOTIFY_COOLDOWN) {
@@ -317,7 +325,7 @@ void __util_sc7a20_init__(void) {
 	if (sc7a20_nvm->isFactoryDefault()) {
 		sc7a20_nvm->restoreDefault();
 		sc7a20_nvm->save();
-		logInfo("initially restored..");
+		logInfo("NVM: 已恢复出厂默认");
 	}
 //	初始化后，清空现场状态
 	rt_sc7a20.status.clear();
@@ -381,7 +389,7 @@ void __util_sc7a20_init__(void) {
 
 	vTaskDelay(pdMS_TO_TICKS(100));
 	// Delay to allow angle to stabilize
-	logInfo("sensor started..");
+	logInfo("加计: 已启动");
 }
 
 util_sc7a20_status_s util_sc7a20_get_status(void) {
@@ -396,18 +404,22 @@ void util_sc7a20_clear_vibration_flag(void) {
 	rt_sc7a20.status.vibration_occured = false;
 }
 
+void util_sc7a20_mark_vibration(void) {
+	rt_sc7a20.status.vibration_occured = true;
+	logInfo("加计: 标记震动");
+}
+
 void util_sc7a20_set_config(util_sc7a20_config_s config) {
 
 //	COPY_STRUCTURE(rt_sc7a20.config, config);
 	memcpy(&rt_sc7a20.config, &config, sizeof(util_sc7a20_config_s));
 
-//	所有传感器设置修改后立即生效
-//	修改的震动冷却定时器立即更新为新的周期
+	/* 周期字段单位为毫秒（与 init / PRODUCT_CONFIG 消抖一致） */
 	xTimerChangePeriod(sc7a20_update_timer,
-			pdMS_TO_TICKS(rt_sc7a20.config.update_period*1000.0f),
+			pdMS_TO_TICKS(rt_sc7a20.config.update_period),
 			portMAX_DELAY);
 	xTimerChangePeriod(sc7a20_cool_down_timer,
-			pdMS_TO_TICKS(rt_sc7a20.config.cool_down_timeout * 1000.0f),
+			pdMS_TO_TICKS(rt_sc7a20.config.cool_down_timeout),
 			portMAX_DELAY);
 	xTimerReset(sc7a20_update_timer, portMAX_DELAY);
 	xTimerReset(sc7a20_cool_down_timer, portMAX_DELAY);

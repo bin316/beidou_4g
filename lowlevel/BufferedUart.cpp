@@ -85,6 +85,8 @@ void BufferedUart::isr_uart_rti(UART_HandleTypeDef *uart, uint16_t pos) {
 //	ignore event if task is not created
 	if (uart_map[uart]->uart_thread_handle == NULL)
 		return;
+	if (uart_map[uart]->rx_paused_)
+		return;
 	uart_map[uart]->received_size = pos;
 	xTaskNotifyFromISR(uart_map[uart]->uart_thread_handle,
 			UART_NOTIFY_RX_COMPLETE, eSetBits, &mustYield);
@@ -92,11 +94,6 @@ void BufferedUart::isr_uart_rti(UART_HandleTypeDef *uart, uint16_t pos) {
 }
 
 void BufferedUart::isr_uart_error(UART_HandleTypeDef *uart) {
-//	BaseType_t mustYield = false;
-//	xTaskNotifyFromISR(uart_map[uart]->uart_thread_handle, UART_NOTIFY_RX_ERROR,
-//			eSetBits, &mustYield);
-//	portYIELD_FROM_ISR(mustYield);
-
 //	errors are not transmitted to thread anymore, just clear the flags, and continue to receive here
 	__HAL_UNLOCK(uart);
 	__HAL_UART_CLEAR_IDLEFLAG(uart);
@@ -104,7 +101,8 @@ void BufferedUart::isr_uart_error(UART_HandleTypeDef *uart) {
 	__HAL_UART_CLEAR_FEFLAG(uart);
 	__HAL_UART_CLEAR_NEFLAG(uart);
 	__HAL_UART_CLEAR_OREFLAG(uart);
-	//	receive resume
+	if (uart_map[uart]->rx_paused_)
+		return;
 	HAL_UARTEx_ReceiveToIdle_DMA(uart, uart_map[uart]->rx_dma_buffer,
 			uart_map[uart]->rx_dma_size);
 }
@@ -140,17 +138,14 @@ void BufferedUart::uart_thread(void *argument) {
 	for (;;) {
 		xTaskNotifyWait(0, 0xffffffff, &notify_value, portMAX_DELAY);
 		if (notify_value & UART_NOTIFY_RX_COMPLETE) {
-//			receive the data from rx dma buffer to rx message buffer
-			if (pthis->received_size > 0) {
-//				if the buffer is full, discard the data
-//				let's consider this condition as some panic phenomenon
-//				$todo we should write some code to handle such kind of panic in the future
-				xStreamBufferSend(pthis->rx_stream_buffer, pthis->rx_dma_buffer,
-						pthis->received_size, 0);
+			if (!pthis->rx_paused_) {
+				if (pthis->received_size > 0) {
+					xStreamBufferSend(pthis->rx_stream_buffer,
+							pthis->rx_dma_buffer, pthis->received_size, 0);
+				}
+				HAL_UARTEx_ReceiveToIdle_DMA(pthis->phuart, pthis->rx_dma_buffer,
+						pthis->rx_dma_size);
 			}
-//			receive continue
-			HAL_UARTEx_ReceiveToIdle_DMA(pthis->phuart, pthis->rx_dma_buffer,
-					pthis->rx_dma_size);
 		}
 		if (notify_value & UART_NOTIFY_RX_ERROR) {
 			__HAL_UNLOCK(pthis->phuart);
@@ -159,33 +154,16 @@ void BufferedUart::uart_thread(void *argument) {
 			__HAL_UART_CLEAR_FEFLAG(pthis->phuart);
 			__HAL_UART_CLEAR_NEFLAG(pthis->phuart);
 			__HAL_UART_CLEAR_OREFLAG(pthis->phuart);
-//			receive resume
-			HAL_UARTEx_ReceiveToIdle_DMA(pthis->phuart, pthis->rx_dma_buffer,
-					pthis->rx_dma_size);
-		}
-		if (notify_value & UART_NOTIFY_TX_COMPLETE) {
-//			try to obtain some data from tx buffer, if obtained transmit them
-			size_t size = xStreamBufferBytesAvailable(pthis->tx_stream_buffer);
-			if (size > 0) {
-				size = size > pthis->tx_dma_size ? pthis->tx_dma_size : size;
-				xStreamBufferReceive(pthis->tx_stream_buffer,
-						pthis->tx_dma_buffer, size, 0);
-//				start a combo transmission
-				HAL_UART_Transmit_DMA(pthis->phuart, pthis->tx_dma_buffer,
-						size);
-			} else {
-//				no data to transmit, set tx busy flag to false
-				pthis->tx_busy = false;
-//				deassert de pin if rs485 mode is enabled
-				if (pthis->rs485_config.enabled)
-					HAL_GPIO_WritePin(pthis->rs485_config.port,
-							pthis->rs485_config.pin, GPIO_PIN_RESET);
+			if (!pthis->rx_paused_) {
+				HAL_UARTEx_ReceiveToIdle_DMA(pthis->phuart, pthis->rx_dma_buffer,
+						pthis->rx_dma_size);
 			}
 		}
-		if (notify_value & UART_NOTIFY_TX_START) {
-//			such notify happens as the user interface wants to start a transmission
-//			start transmission only if the tx buffer is not busy
-			if (!pthis->tx_busy) {
+		if (notify_value & UART_NOTIFY_TX_COMPLETE) {
+			if (pthis->rx_paused_) {
+				/* 注入期间不用流式 TX DMA */
+				pthis->tx_busy = false;
+			} else {
 				size_t size = xStreamBufferBytesAvailable(
 						pthis->tx_stream_buffer);
 				if (size > 0) {
@@ -193,11 +171,28 @@ void BufferedUart::uart_thread(void *argument) {
 							pthis->tx_dma_size : size;
 					xStreamBufferReceive(pthis->tx_stream_buffer,
 							pthis->tx_dma_buffer, size, 0);
-//					assert de pin if rs485 mode is enabled
+					HAL_UART_Transmit_DMA(pthis->phuart, pthis->tx_dma_buffer,
+							size);
+				} else {
+					pthis->tx_busy = false;
+					if (pthis->rs485_config.enabled)
+						HAL_GPIO_WritePin(pthis->rs485_config.port,
+								pthis->rs485_config.pin, GPIO_PIN_RESET);
+				}
+			}
+		}
+		if (notify_value & UART_NOTIFY_TX_START) {
+			if (!pthis->rx_paused_ && !pthis->tx_busy) {
+				size_t size = xStreamBufferBytesAvailable(
+						pthis->tx_stream_buffer);
+				if (size > 0) {
+					size = size > pthis->tx_dma_size ?
+							pthis->tx_dma_size : size;
+					xStreamBufferReceive(pthis->tx_stream_buffer,
+							pthis->tx_dma_buffer, size, 0);
 					if (pthis->rs485_config.enabled)
 						HAL_GPIO_WritePin(pthis->rs485_config.port,
 								pthis->rs485_config.pin, GPIO_PIN_SET);
-//					claim busy and start a initial transmission
 					pthis->tx_busy = true;
 					HAL_UART_Transmit_DMA(pthis->phuart, pthis->tx_dma_buffer,
 							size);
@@ -277,6 +272,22 @@ int BufferedUart::ioctl(int cmd, void *arg) {
 		break;
 	case _flush_rx:
 		xStreamBufferReset(rx_stream_buffer);
+		break;
+	case _rx_pause:
+		this->rx_paused_ = true;
+		(void) HAL_UART_Abort(this->phuart); /* 收发一并停，清 BUSY */
+		__HAL_UNLOCK(this->phuart);
+		this->phuart->gState = HAL_UART_STATE_READY;
+		this->phuart->RxState = HAL_UART_STATE_READY;
+		this->tx_busy = false;
+		xStreamBufferReset(this->tx_stream_buffer);
+		xStreamBufferReset(this->rx_stream_buffer);
+		break;
+	case _rx_resume:
+		this->tx_busy = false;
+		this->rx_paused_ = false;
+		(void) HAL_UARTEx_ReceiveToIdle_DMA(this->phuart, this->rx_dma_buffer,
+				this->rx_dma_size);
 		break;
 	case _soft_rs485: {
 		rs485_config_t *config = (rs485_config_t*) arg;

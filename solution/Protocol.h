@@ -3,6 +3,20 @@
  *
  *  Created on: Jan 18, 2025
  *      Author: IRIS
+ *
+ * ------------------------------------------------------------------------------
+ * 卫星数量 sats 字段说明
+ * ------------------------------------------------------------------------------
+ * pb_report 中添加第25字节 sats 字段表示用于定位的卫星数量，来源于 GGA 语句的 numSv，
+ * 范围 0~24，0 表示未定位或无效，用于上报数据包中体现定位质量。
+ *
+ * ------------------------------------------------------------------------------
+ * status 定位状态位（bit0）与“上报后置否”
+ * ------------------------------------------------------------------------------
+ * status 的 bit0 为定位状态位：1 表示本帧 geo[] 为新定位数据，0 表示非新/旧定位数据。
+ * 每次成功上报后设备会将该位对应的内部标志置否，下一帧仅在有新 RMC 时才再为 1，
+ * 以提升服务器对“是否为新定位数据”判断的准确性。详见 solution/Solution.cpp、
+ * bsp/util_atgm332d.cpp、bsp/utilties.h。
  */
 
 #ifndef PROTOCOL_H_
@@ -30,6 +44,10 @@ typedef enum : uint8_t
     up_systemConfigUpload = 10,
     up_systemConfigResult = 12,
     up_responseWorkMode = 14,
+    up_firmwareVersionUpload = 16,
+    up_locateGeoResult = 18,
+    up_locateSwitchResult = 20,
+    up_locateSwitchUpload = 22,
 
     down_uploadReport = 1,
     down_uploadRunningConfig = 3,
@@ -39,20 +57,24 @@ typedef enum : uint8_t
     down_uploadSystemConfig = 11,
     down_configSystem = 13,
     down_configWorkMode = 15,
+    down_uploadFirmwareVersion = 17,
+    down_configLocateGeo = 19,
+    down_configLocateSwitch = 21,
+    down_uploadLocateSwitch = 23,
 
     preserved
     } e_pb_func;
 
 typedef enum : uint8_t
     {
-    edit_enabled = 0x00,
-    edit_notEnabled = 0x01,
+    edit_notEnabled = 0x00,
+    edit_enabled = 0x01,
 
-    edit_pwdChangeFailed = 0x02,
-    edit_pwdChangeSuccess = 0x03,
+    edit_pwdChangeFailed = 0x00,
+    edit_pwdChangeSuccess = 0x01,
     edit_pwdConfirm = 0xf0,
 
-    edit_exit = 0x04
+    edit_exit = 0x02
 
     } e_editMode_result;
 
@@ -102,13 +124,14 @@ typedef struct
     {
     uint32_t time; 		//unix时间
     float geo[2]; 		//地理信息，0经度，1纬度
-    uint8_t status; 	//新旧地理信息标记
+    uint8_t status; 	//工作模式(2)+唤醒源(2)+震动状态(1)+保留位(1)+倾斜状态(1)+定位状态(1)，对应bit7~0
     int16_t acc[3]; 	//x、y、z三周加速度，单位mg
-    int16_t angle; 	//倾角
+    int16_t angle; 	    //倾角
     uint8_t vbat; 		//电池电压
     int8_t temp; 		//主机温度
-    uint8_t csq;
-    } pb_report; 		//sizeof(report) = 24
+    uint8_t csq;        //4G模块信号强度
+    uint8_t sats;       //用于定位的卫星数量
+    } pb_report; 		//sizeof(report) = 25
 
 typedef struct
     {
@@ -123,8 +146,8 @@ typedef struct RunningConfig
     uint16_t t1_netBad_wakeup_min;       //3(单位[分钟])
 //	服务器无响应重传超时	solution
     uint8_t t2_serverRsps_timeout_sec;   //3(单位[秒])
-//	定位搜索休眠倒计时	solution
-    uint8_t t3_gnssSearch_sleep_sec;     //180(单位[秒])
+//	唤醒后硬计时休眠倒计时（收包不续命）	solution
+    uint8_t t3_gnssSearch_sleep_sec;     //100(单位[秒])
 //	定位成功休眠倒计时	solution
     uint8_t t4_gnssGood_sleep_sec;       //60(单位[秒])
 //	例行唤醒事件休眠倒计时	solution
@@ -203,6 +226,20 @@ typedef struct SystemConfig
 	}
     } pb_systemConfig;
 
+/** 固件版本：年(后两位)/月/当月修订号，均为二进制整数 */
+typedef struct
+    {
+    uint8_t year;
+    uint8_t month;
+    uint8_t revision;
+    } pb_firmwareVersion;
+
+/** 下行 19：写入经纬度 */
+typedef struct
+    {
+    float geo[2]; // [0]经度 [1]纬度
+    } pb_locateGeo;
+
 typedef struct
     {
     const uint8_t prefix[3] =
@@ -212,7 +249,7 @@ typedef struct
     struct
 	{
 	pb_header header; //sizeof(header) = 6
-	pb_report report; //sizeof(report) = 24
+	pb_report report; //sizeof(report) = 25
 	uint16_t crc; //sizeof(crc) = 2
 	} body;
     } pb_packReport;
@@ -285,6 +322,21 @@ typedef struct
 	uint16_t crc;
 	} body;
     } pb_packCmdletOrResponseSimple;
+
+/** 上行固件版本回复包：FA×3 + header + year/month/revision + CRC */
+typedef struct
+    {
+    const uint8_t prefix[3] =
+	{
+	0xFA, 0xFA, 0xFA
+	};
+    struct
+	{
+	pb_header header;
+	pb_firmwareVersion firmwareVersion;
+	uint16_t crc;
+	} body;
+    } pb_packFirmwareVersion;
 
 #pragma pack(pop)
 

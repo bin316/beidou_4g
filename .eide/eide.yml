@@ -8,6 +8,7 @@ srcDirs:
   - solution
   - bsp
   - lettershell
+  - segger_rtt
   - templates
   - Core
   - Middlewares
@@ -47,6 +48,7 @@ targets:
         - fmt
         - fmt/include
         - lettershell
+        - segger_rtt
         - USB_DEVICE/App
         - USB_DEVICE/Target
         - Middlewares/ST/STM32_USB_Device_Library/Core/Inc
@@ -57,6 +59,7 @@ targets:
     excludeList:
       - util_air780.cpp
       - bsp/util_air780.cpp
+      - segger_rtt/SEGGER_RTT_ASM_ARMv7M.S
     toolchain: GCC
     toolchainConfigMap:
       GCC:
@@ -136,6 +139,7 @@ targets:
         - fmt/include
         - fmt
         - lettershell
+        - segger_rtt
         - USB_DEVICE/App
         - USB_DEVICE/Target
         - Middlewares/ST/STM32_USB_Device_Library/Core/Inc
@@ -146,6 +150,7 @@ targets:
     excludeList:
       - util_air780.cpp
       - bsp/util_air780.cpp
+      - segger_rtt/SEGGER_RTT_ASM_ARMv7M.S
     toolchain: GCC
     toolchainConfigMap:
       GCC:
