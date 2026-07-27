@@ -9,6 +9,7 @@
 
 #include "main.h"
 #include "rtc.h"
+#include "iwdg.h"
 
 #define NVM_BASE_ADDRESS				0x08000000
 #define NVM_START_ADDRESS				0x0803F800
@@ -106,6 +107,11 @@ void __flash_sync(void)
 	HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
 		(flash_BaseAddress) + i * 8,
 		*((uint64_t*) &flash_pagebuffer[i * 8]));
+	/* 擦写期间取指停顿，定时喂狗防 IWDG（约 4s） */
+	if ((i & 0x1F) == 0)
+	    {
+	    HAL_IWDG_Refresh(&hiwdg);
+	    }
 	}
     HAL_FLASH_Lock();
     xSemaphoreGive(flash_Sem);

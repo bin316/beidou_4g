@@ -206,6 +206,23 @@ static uint8_t locate_switch_normalize(uint8_t locate_switch)
     return v;
     }
 
+/** 上位机改参：各分区已 save 进页缓冲后，统一擦写 Flash（对齐 Slope 应答前 sync） */
+static void nvm_commit_host_config(void)
+    {
+    __flash_sync();
+    logInfo("NVM: 上位机配置已刷入Flash");
+    }
+
+/** 进配置模式允许的意图：随后要写的下行功能码（不含改密 9） */
+static bool config_enter_intent_valid(uint8_t intent)
+    {
+    return intent == e_pb_func::down_configRunning
+	    || intent == e_pb_func::down_configSystem
+	    || intent == e_pb_func::down_configWorkMode
+	    || intent == e_pb_func::down_configLocateGeo
+	    || intent == e_pb_func::down_configLocateSwitch;
+    }
+
 /**
  * 出厂默认 locate_switch：三宏 0/1 按位拼装后再 normalize
  * （改 PRODUCT_CONFIG 三宏只影响恢复出厂；已落盘 NVM 需协议改或擦除）
@@ -451,6 +468,20 @@ Solution::Solution()
 	    (unsigned) locate_switch_factory_default());
     }
 
+    /* 配置会话意图仅 RAM；唤醒后若 NVM 仍标 editing 则清掉，须重新进模式 */
+    if (this->rt_solution.configEditting || this->rt_solution.passwordConfirm)
+	{
+	this->rt_solution.configEditting = 0;
+	this->rt_solution.passwordConfirm = 0;
+	this->rt_solution.newPassword =
+	    {
+	    0
+	    };
+	this->config_intent_ = 0;
+	nvm->save();
+	logInfo("配置会话: 上电清除残留 editing，需重新进模式");
+	}
+
     /*
      * 解决方案任务启动
      * 模式启动不同任务
@@ -461,9 +492,9 @@ Solution::Solution()
 	{
     // AI生成注释: 工作模式 - 创建工作例程线程，具备完整功能
     case solution_mode_e::wm_work:
-	/* report/AGNSS/事件处理较重，512 易栈溢出 SoftReset */
+	/* report/消息叠加；1536 使 RAM 溢出，取 1280 折中 */
 	xTaskCreate(Solution::solution_work_routine_thread, "solution_work",
-		1024, this, osPriorityNormal, &solution_thread_handle);
+		1280, this, osPriorityNormal, &solution_thread_handle);
 	break;
     // AI生成注释: 空闲模式 - 创建空闲例程线程，功能受限以节省电能
     case solution_mode_e::wm_idle:
@@ -521,13 +552,16 @@ static void log_hex_dump(const char *tag, const uint8_t *raw, unsigned len)
     }
 
 /**
- * @brief 打印上报整包：包头字段、数据域、CRC，以及完整原始 hex
+ * @brief 打印上报整包摘要；高频连报时跳过 hex，降低 snprintf/RTT 栈压（防 SoftReset）
  */
 static void log_report_packet(const pb_packReport *pkt)
     {
-    const uint8_t *raw = (const uint8_t*) pkt;
-    const unsigned total = sizeof(pb_packReport);
-    /* 坐标用 1e-4 度整数，避免 %f 撑爆任务栈 */
+    static TickType_t s_last_hex_tick = 0;
+    const TickType_t now = xTaskGetTickCount();
+    const bool dump_hex =
+	    (s_last_hex_tick == 0)
+		    || ((now - s_last_hex_tick) >= pdMS_TO_TICKS(2000));
+
     logInfo(
 	    "上报字段: 时间=%lu 坐标_e4=[%ld,%ld] 状态=0x%02X 加速度=[%d,%d,%d] 倾角=%d 电压=%u 温度=%d CSQ=%u 卫星=%u",
 	    (unsigned long) pkt->body.report.time,
@@ -538,7 +572,11 @@ static void log_report_packet(const pb_packReport *pkt)
 	    pkt->body.report.angle, pkt->body.report.vbat, pkt->body.report.temp,
 	    pkt->body.report.csq, pkt->body.report.sats);
 
-    log_hex_dump("上报hex", raw, total);
+    if (dump_hex)
+	{
+	s_last_hex_tick = now;
+	log_hex_dump("上报hex", (const uint8_t*) pkt, sizeof(pb_packReport));
+	}
     }
 
 /**
@@ -546,9 +584,15 @@ static void log_report_packet(const pb_packReport *pkt)
  */
 static void log_rx_raw(const uint8_t *raw, uint16_t len)
     {
+    static TickType_t s_last_rx_hex_tick = 0;
+    const TickType_t now = xTaskGetTickCount();
     logInfo("收包原始 %u字节", (unsigned) len);
-    if (len > 0)
+    /* 连报风暴时限频打 hex，减轻 solution 任务栈与 RTT 压力 */
+    if (len > 0
+	    && (s_last_rx_hex_tick == 0
+		    || (now - s_last_rx_hex_tick) >= pdMS_TO_TICKS(2000)))
 	{
+	s_last_rx_hex_tick = now;
 	log_hex_dump("收包hex", raw, len);
 	}
     }
@@ -598,10 +642,19 @@ void Solution::report(void)
     rsps.body.report.time = (uint32_t) util_lowpower_get_rtc();
     // AI生成注释: 设置电池电压（转换为0.1V为单位的8位整数）
     rsps.body.report.vbat = (uint8_t) (analog.vbat * 10.0f);
-    // AI生成注释: 更新4G模块信号强度（同步获取）
-    int csq_now = air->getCsq();
-    // AI生成注释: 设置4G模块信号强度
+    /* 功能码1连报时避免每次 AT+CSQ（占 at_mutex，易与 RX/写包叠出 HardFault） */
+    {
+    static int s_csq_cache = 0;
+    static TickType_t s_csq_tick = 0;
+    const TickType_t now = xTaskGetTickCount();
+    if (s_csq_tick == 0 || (now - s_csq_tick) >= pdMS_TO_TICKS(3000))
+	{
+	s_csq_cache = air->getCsq();
+	s_csq_tick = now;
+	}
+    const int csq_now = s_csq_cache;
     rsps.body.report.csq = (csq_now < 0) ? 0 : (uint8_t) csq_now;
+    }
     // AI生成注释: 设置用于定位的卫星数量（来自GGA的numSv，表示定位质量）
     rsps.body.report.sats = util_atgm332d_get_status().sats;
     // AI生成注释: 计算数据包的CRC校验值
@@ -611,7 +664,12 @@ void Solution::report(void)
     log_report_packet(&rsps);
 
     // AI生成注释: 发送数据包到服务器
-    send_message((uint8_t*) &rsps, sizeof(pb_packReport));
+    const int send_ret = send_message((uint8_t*) &rsps, sizeof(pb_packReport));
+    /* send_message 会清 awaiting；仅上报发送成功后再置位，供 OK 确认休眠 */
+    if (send_ret >= 0)
+	{
+	mark_report_pending_ack();
+	}
 
     // 上报完成后将定位状态标志位置否，使下一帧仅在有新 RMC 时才标为“新定位数据”
     util_atgm332d_clear_fix_flag();
@@ -670,13 +728,14 @@ void Solution::event_action_vibration(void)
     {
     logInfo("震动事件: 收到");
     xTimerReset(server_timeout_timer, portMAX_DELAY);
-    /* 对齐 Slope：先 report，再启定位/LBS 会话（首包不含本周期新 LBS） */
+    /* 先 report，再 GNSS；LBS 仅本震动路径且看 locateSwitch（首包不含本周期新 LBS） */
     logInfo("震动事件: 立即上报");
     this->report();
     if (rt_solution.mode == solution_mode_e::wm_work)
 	{
-	logInfo("震动事件: 工作模式, 启动定位(允许LBS)");
-	this->start_locate(true);
+	logInfo("震动事件: 工作模式, 启动定位");
+	this->start_locate();
+	this->start_lbs_if_needed();
 	}
     else
 	{
@@ -747,29 +806,10 @@ void Solution::event_action_message(void)
 				(uint32_t*) (hb_ptr + 3), 6);
 			if (hb_calc_crc == hb_target_crc)
 				{
-				/* AGNSS 期间忽略 OK 进睡，避免打断 link2（对齐 Slope） */
-				if (util_agnss_rx_is_active())
-				{
-				logInfo("心跳已收到, AGNSS进行中忽略休眠");
+				logInfo("确认收到OK回复");
+				this->message_heartbeat();
 				vPortFree(message);
 				return;
-				}
-				if (util_lowpower_get_wake_source()
-				!= util_lowpower_wake_source_e::pin)
-				{
-				logInfo(
-					"心跳已收到, 进入休眠");
-				vPortFree(message);
-				this->message_sleep();
-				return;
-				}
-			else
-				{
-				logInfo(
-					"心跳已收到, 震动唤醒中忽略休眠");
-				vPortFree(message);
-				return;
-				}
 				}
 			}
 			}
@@ -849,7 +889,17 @@ void Solution::event_action_message(void)
 			break;
 		    // AI生成注释: 服务器请求进入配置模式
 		    case e_pb_func::down_configMode:
-			this->message_enter_config_mode((password*) param_ptr);
+			if (possible_header->dataLen == sizeof(pb_configModeReq))
+			    {
+			    this->message_enter_config_mode(
+				    (pb_configModeReq*) param_ptr);
+			    }
+			else
+			    {
+			    logInfo("配置模式: 载荷长度错误 (期望 %u)",
+				    (unsigned) sizeof(pb_configModeReq));
+			    this->message_enter_config_mode(nullptr);
+			    }
 			break;
 		    // AI生成注释: 服务器请求上传系统配置
 		    case e_pb_func::down_uploadSystemConfig:
@@ -962,7 +1012,7 @@ void Solution::message_change_run_parameters(pb_runningConfig *params)
     rsps.body.header.function = e_pb_func::up_runningConfigResult;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
 
-    if (this->rt_solution.configEditting)
+    if (this->config_write_allowed(e_pb_func::down_configRunning))
 	{
 	// AI生成注释: 配置编辑模式下，应用运行配置
 	rt_solution.runningConfig = *params;
@@ -982,6 +1032,7 @@ void Solution::message_change_run_parameters(pb_runningConfig *params)
 	analog_config.low_battery_threshold = params->n1_vbatAlarm_threshold_volt / 10.0f;
 	util_analog_set_config(analog_config);
 	nvm->save();
+	nvm_commit_host_config();
 	rsps.body.cmdletOrResponse = 0; /* 0: 全部设定成功 */
 	}
     else
@@ -1028,6 +1079,7 @@ void Solution::message_sleep(void)
     // AI生成注释: 休眠前保存所有配置到NVM
     nvm->save();
     util_atgm332d_nvm_flush();
+    clear_config_session_for_standby();
 //	sleep
     // AI生成注释: 获取当前低功耗配置
     auto lpconfig = util_lowpower_get_config();
@@ -1045,18 +1097,12 @@ void Solution::message_sleep(void)
     }
 
 /**
- * AI生成注释: 处理服务器配置模式请求的消息
- * 功能说明:
- * 1. 处理密码验证和配置模式切换
- * 2. 支持进入配置模式、退出配置模式、密码修改功能
- * 3. 实现密码确认机制防止误操作
- * 4. 发送配置模式操作结果到服务器
+ * @brief 服务器请求进/退配置模式或改密（功能码 9）
+ * @param req 密码 8B + intentFunc 1B；null 或非法长度由调用方传 null，应答 00 00
  */
-void Solution::message_enter_config_mode(password *pwd)
+void Solution::message_enter_config_mode(pb_configModeReq *req)
     {
-    // AI生成注释: 创建命令响应数据包
-    pb_packCmdletOrResponse rsps;
-    // AI生成注释: 定义退出配置模式的特殊密码（全零）
+    pb_packConfigModeRsp rsps;
     password exitWord =
 	{
 	.item =
@@ -1064,81 +1110,131 @@ void Solution::message_enter_config_mode(password *pwd)
 	    0
 	    }
 	};
-    // AI生成注释: 设置响应数据包头部信息
+
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     rsps.body.header.function = e_pb_func::up_responseConfigMode;
-    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.header.dataLen = sizeof(pb_configModeRsp);
+    rsps.body.configMode.result = edit_notEnabled;
+    rsps.body.configMode.intentFunc = 0;
 
-//	非编辑模式，判断密码并进入编辑模式
-    // AI生成注释: 如果当前不在配置编辑模式
+    if (req == nullptr)
+	{
+	rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+		CFL(rsps.body));
+	send_message((uint8_t*) &rsps, sizeof(pb_packConfigModeRsp));
+	return;
+	}
+
+    password &pwd = req->pwd;
+    const uint8_t intent = req->intentFunc;
+
     if (!this->rt_solution.configEditting)
 	{
-	// AI生成注释: 验证输入密码是否正确
-	if (this->rt_solution.pwd == *pwd)
+	/* A. 进模式：合法写意图 + 正确密码 */
+	if (!config_enter_intent_valid(intent))
 	    {
-	    // AI生成注释: 密码正确，进入配置编辑模式
+	    logInfo("配置模式进入失败: 非法意图 0x%02X", intent);
+	    }
+	else if (this->rt_solution.pwd == pwd)
+	    {
 	    this->rt_solution.configEditting = true;
-	    rsps.body.cmdletOrResponse = edit_enabled;
+	    this->config_intent_ = intent;
+	    nvm->save();
+	    nvm_commit_host_config();
+	    rsps.body.configMode.result = edit_enabled;
+	    rsps.body.configMode.intentFunc = intent;
+	    }
+	}
+    else if (pwd == exitWord)
+	{
+	/* B. 退出：密码全 0 且 intent 必须为 0，成功回 02 00 */
+	if (intent != 0u)
+	    {
+	    logInfo("配置模式退出失败: intent 须为 0 (收到 0x%02X)", intent);
+	    /* 保持配置态，应答保持默认 00 00 */
 	    }
 	else
 	    {
-	    // AI生成注释: 密码错误，配置编辑模式未启用
-	    rsps.body.cmdletOrResponse = edit_notEnabled;
+	    this->rt_solution.configEditting = false;
+	    this->rt_solution.newPassword = exitWord;
+	    this->rt_solution.passwordConfirm = 0;
+	    this->config_intent_ = 0;
+	    nvm->save();
+	    nvm_commit_host_config();
+	    rsps.body.configMode.result = edit_exit;
+	    rsps.body.configMode.intentFunc = 0;
 	    }
 	}
-//	编辑模式，识别退出密码，或更改密码
-    else
+    else if (intent == e_pb_func::down_configMode)
 	{
-//	 编辑模式优先识别退出功能
-	// AI生成注释: 如果输入的是退出密码（全零密码）
-	if (*pwd == exitWord)
+	/* C. 改密：必须 intent=9 */
+	if (this->rt_solution.passwordConfirm)
 	    {
-//	 	退出编辑模式也会清空newpassword
-	    // AI生成注释: 退出配置编辑模式
-	    this->rt_solution.configEditting = false;
-	    // AI生成注释: 清空新密码缓存
-	    this->rt_solution.newPassword = exitWord;
-	    // AI生成注释: 清除密码确认标志
-	    this->rt_solution.passwordConfirm = 0;
-	    rsps.body.cmdletOrResponse = edit_exit;
-	    }
-//		若已经开始编辑密码则不进入下一分支（开始编辑密码）
-	// AI生成注释: 如果正在进行密码确认流程
-	else if (this->rt_solution.passwordConfirm)
-	    {
-//	 	若密码确认成功则返回密码修改成功
-	    // AI生成注释: 验证两次输入的新密码是否一致
-	    if (*pwd == this->rt_solution.newPassword)
+	    if (pwd == this->rt_solution.newPassword)
 		{
-		// AI生成注释: 密码确认成功，修改密码
-		rsps.body.cmdletOrResponse = edit_pwdChangeSuccess;
+		this->rt_solution.pwd = this->rt_solution.newPassword;
+		nvm->save();
+		nvm_commit_host_config();
+		rsps.body.configMode.result = edit_pwdChangeSuccess;
+		rsps.body.configMode.intentFunc = e_pb_func::down_configMode;
+		logInfo("配置模式: 密码已更新并落盘");
 		}
 	    else
 		{
-//		 若密码确认失败则清空记录的newpassword并返回失败
-		// AI生成注释: 密码确认失败，清空新密码缓存
 		this->rt_solution.newPassword = exitWord;
-		rsps.body.cmdletOrResponse = edit_pwdChangeFailed;
+		rsps.body.configMode.result = edit_pwdChangeFailed;
+		rsps.body.configMode.intentFunc = 0;
 		}
-	    // AI生成注释: 清除密码确认标志
 	    this->rt_solution.passwordConfirm = 0;
 	    }
-//		若未编辑密码则开始编辑密码
 	else
 	    {
-//	    返回f0表示再输一次密码
-	    // AI生成注释: 开始密码修改流程，保存新密码并等待确认
-	    this->rt_solution.newPassword = *pwd;
-	    // AI生成注释: 设置密码确认标志，等待再次输入确认
+	    this->rt_solution.newPassword = pwd;
 	    this->rt_solution.passwordConfirm = 1;
-	    rsps.body.cmdletOrResponse = edit_pwdConfirm;
+	    rsps.body.configMode.result = edit_pwdConfirm;
+	    rsps.body.configMode.intentFunc = e_pb_func::down_configMode;
 	    }
 	}
-    // AI生成注释: 计算响应数据包的CRC校验值
+    else
+	{
+	/* D. 已在配置态且非退出/改密：禁止用本帧切换意图 */
+	if (this->rt_solution.passwordConfirm)
+	    {
+	    this->rt_solution.newPassword = exitWord;
+	    this->rt_solution.passwordConfirm = 0;
+	    }
+	logInfo("配置模式: 会话中非法帧 intent=0x%02X（保持原意图 0x%02X）",
+		intent, this->config_intent_);
+	}
+
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
-    // AI生成注释: 发送配置模式响应到服务器
-    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    send_message((uint8_t*) &rsps, sizeof(pb_packConfigModeRsp));
+    }
+
+/** 配置态且会话意图匹配时才允许写参 */
+bool Solution::config_write_allowed(uint8_t write_func) const
+    {
+    return this->rt_solution.configEditting && this->config_intent_ == write_func;
+    }
+
+/** 进 Standby 前清 editing/intent/改密确认，避免跨睡无意图残留 */
+void Solution::clear_config_session_for_standby(void)
+    {
+    if (!this->rt_solution.configEditting && !this->rt_solution.passwordConfirm
+	    && this->config_intent_ == 0)
+	{
+	return;
+	}
+    logInfo("进 Standby 前清除配置会话 (intent=0x%02X)", this->config_intent_);
+    this->rt_solution.configEditting = 0;
+    this->rt_solution.passwordConfirm = 0;
+    this->rt_solution.newPassword =
+	{
+	0
+	};
+    this->config_intent_ = 0;
+    nvm->save();
     }
 
 /**
@@ -1202,11 +1298,13 @@ void Solution::message_config_locate_geo(pb_locateGeo *geo)
     pb_packCmdletOrResponse rsps;
     uint8_t ok = 0;
 
-    if (this->rt_solution.configEditting && geo != nullptr)
+    if (this->config_write_allowed(e_pb_func::down_configLocateGeo)
+	    && geo != nullptr)
 	{
 	if (util_atgm332d_set_manual_geo(geo->geo[ID_LONGITUDE],
 		geo->geo[ID_LATITUDE]))
 	    {
+	    nvm_commit_host_config();
 	    ok = 1;
 	    }
 	}
@@ -1230,7 +1328,8 @@ void Solution::message_config_locate_switch(uint8_t *value)
     pb_packCmdletOrResponse rsps;
     uint8_t result = 0;
 
-    if (this->rt_solution.configEditting && value != nullptr)
+    if (this->config_write_allowed(e_pb_func::down_configLocateSwitch)
+	    && value != nullptr)
 	{
 	const uint8_t raw = (uint8_t) (*value & kLocateSwitchMask);
 	/* 先判非法组合再 normalize，避免把「仅 AGNSS」静默改成全关 */
@@ -1245,6 +1344,7 @@ void Solution::message_config_locate_switch(uint8_t *value)
 	    this->rt_solution.locate_switch = locate_switch_normalize(raw);
 	    util_atgm332d_deactivate();
 	    nvm->save();
+	    nvm_commit_host_config();
 	    result = 1;
 	    logInfo("定位开关: 已更新 0x%02X",
 		    (unsigned) this->rt_solution.locate_switch);
@@ -1392,10 +1492,10 @@ void Solution::lbs_process_due(void)
 
     if (got && lbs.ok)
 	{
-	logInfo("定位: LBS成功, 写入坐标");
+	logInfo("定位: LBS成功, 按NVM门限处理坐标");
 	(void) util_atgm332d_apply_lbs_geo(lbs.longitude, lbs.latitude);
 	lbs_session_stop();
-	logInfo("LBS：本唤醒成功，停止会话 (attempts=%u)",
+	logInfo("LBS：本唤醒查询完成，停止会话 (attempts=%u)",
 		(unsigned) s_lbs_attempts);
 	return;
 	}
@@ -1415,63 +1515,65 @@ void Solution::lbs_process_due(void)
     }
 
 /**
- * @brief 按 locate_switch 启动定位
- * @param allow_lbs true=允许本路径启 LBS 会话（引脚/震动）
+ * @brief 按 locate_switch 启 GNSS/AGNSS；LBS 不在此启（见 start_lbs_if_needed）
  */
-void Solution::start_locate(bool allow_lbs)
+void Solution::start_locate(void)
     {
     const uint8_t sw = locate_switch_normalize(this->rt_solution.locate_switch);
     const bool want_gnss = locate_gnss_on(sw);
     const bool want_agnss = locate_agnss_on(sw);
-    /* LBS: 需开关bit2 且本路径允许(引脚/震动)；真正 AT 在 lbs_process_due */
-    const bool want_lbs = allow_lbs && locate_lbs_on(sw);
 
-    logInfo("定位: 开关=0x%02X GNSS=%u AGNSS=%u LBS=%u 允许LBS=%u",
+    logInfo("定位: 开关=0x%02X GNSS=%u AGNSS=%u LBS配置=%u",
 	    (unsigned) sw, want_gnss ? 1u : 0u, want_agnss ? 1u : 0u,
-	    locate_lbs_on(sw) ? 1u : 0u, allow_lbs ? 1u : 0u);
+	    locate_lbs_on(sw) ? 1u : 0u);
 
-    if (!want_gnss && !want_lbs)
+    if (!want_gnss)
 	{
-	logInfo("定位: 跳过(无需GNSS/LBS)");
+	logInfo("定位: 跳过(GNSS关)");
 	return;
 	}
 
-    if (want_gnss)
+    /* 定住后关模块延迟用 t4（0→activate 内兜底 3s） */
+    const uint32_t post_fix_sec =
+	    (uint32_t) this->rt_solution.runningConfig.t4_gnssGood_sleep_sec;
+    logInfo("定位: 开启北斗, 定住后%us关模块",
+	    (unsigned) ((post_fix_sec == 0u) ? 3u : post_fix_sec));
+    util_atgm332d_activate(post_fix_sec);
+    vTaskDelay(pdMS_TO_TICKS(PROD_CONFIG_AGNSS_PWR_SETTLE_MS));
+    logInfo("定位: 北斗上电稳定结束");
+    if (want_agnss && this->air != nullptr && !util_agnss_done_this_wake())
 	{
-	logInfo("定位: 开启北斗");
-	util_atgm332d_activate(10);
-	vTaskDelay(pdMS_TO_TICKS(PROD_CONFIG_AGNSS_PWR_SETTLE_MS));
-	logInfo("定位: 北斗上电稳定结束");
-	if (want_agnss && this->air != nullptr
-		&& !util_agnss_done_this_wake())
-	    {
-	    logInfo("定位: 拉取AGNSS");
-	    (void) util_agnss_fetch_and_inject_once(this->air);
-	    }
-	else if (want_agnss && util_agnss_done_this_wake())
-	    {
-	    logInfo("定位: AGNSS本唤醒已做过, 跳过");
-	    }
-	else if (want_agnss)
-	    {
-	    logInfo("定位: AGNSS跳过(无4G实例)");
-	    }
+	logInfo("定位: 拉取AGNSS");
+	(void) util_agnss_fetch_and_inject_once(this->air);
 	}
+    else if (want_agnss && util_agnss_done_this_wake())
+	{
+	logInfo("定位: AGNSS本唤醒已做过, 跳过");
+	}
+    else if (want_agnss)
+	{
+	logInfo("定位: AGNSS跳过(无4G实例)");
+	}
+    logInfo("定位: GNSS流程结束");
+    }
 
-    if (!want_lbs)
+/**
+ * @brief 震动唤醒路径调用：配置开 LBS 且当前未定住则启会话（AT 在事件循环）
+ */
+void Solution::start_lbs_if_needed(void)
+    {
+    const uint8_t sw = locate_switch_normalize(this->rt_solution.locate_switch);
+    if (!locate_lbs_on(sw))
 	{
-	logInfo("定位: LBS开关关或本路径不允许, 跳过");
+	logInfo("LBS: 开关关, 跳过");
+	return;
 	}
-    else if (want_lbs && util_atgm332d_get_status().position_fixed)
+    if (util_atgm332d_get_status().position_fixed)
 	{
-	logInfo("定位: LBS跳过(北斗已定位)");
+	logInfo("LBS: 北斗已定位, 跳过");
+	return;
 	}
-    else
-	{
-	/* 对齐 Slope：AGNSS 后只启会话，查询放到事件循环，避免与首包/t2 抢时序 */
-	this->lbs_session_start();
-	}
-    logInfo("定位: 流程结束");
+    this->lbs_session_start();
     }
 
 /**
@@ -1492,7 +1594,7 @@ void Solution::message_change_sys_parameters(pb_systemConfig *params)
     rsps.body.header.function = e_pb_func::up_systemConfigResult;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
 
-    if (this->rt_solution.configEditting)
+    if (this->config_write_allowed(e_pb_func::down_configSystem))
 	{
 	// AI生成注释: 配置编辑模式下，应用系统配置
 	this->rt_solution.systemConfig = *params;
@@ -1505,6 +1607,7 @@ void Solution::message_change_sys_parameters(pb_systemConfig *params)
 	sensor_config.acc_thres16mg_lsb = params->sensorVibrationThreshold;
 	util_sc7a20_set_config(sensor_config);
 	nvm->save();
+	nvm_commit_host_config();
 	rsps.body.cmdletOrResponse = 0; /* 0: 全部设定成功 */
 	}
     else
@@ -1529,116 +1632,123 @@ void Solution::message_change_sys_parameters(pb_systemConfig *params)
  */
 void Solution::message_change_execute_mode(solution_mode_e *mode)
     {
-    // AI生成注释: 模式有效性标志
-    bool modeValid = false;
-
-    // AI生成注释: 创建命令响应数据包
     pb_packCmdletOrResponse rsps;
+    const bool modeValid = enum_contains<solution_mode_e>(*mode);
+    /* 配置模式 + 意图匹配 + 合法 + 与当前不同，才切换 */
+    const bool willSwitch = this->config_write_allowed(
+	    e_pb_func::down_configWorkMode) && modeValid
+	    && this->rt_solution.mode != *mode;
 
-    // AI生成注释: 设置响应数据包头部信息
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     rsps.body.header.function = e_pb_func::up_responseWorkMode;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
 
-    // AI生成注释: 验证工作模式是否为有效的枚举值
-    if (enum_contains<solution_mode_e>(*mode))
+    if (!willSwitch)
 	{
-	modeValid = true;
+	rsps.body.cmdletOrResponse = 0; /* 功能码14：失败/未切换 */
+	rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+		CFL(rsps.body));
+	send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+	logInfo("运行模式未改变");
+	return;
 	}
 
-//	@notice 只要设置模式打开，界桩应尽力切换到目标模式，而不应存在切换失败的问题
-//	且输入的模式应合法
-    // AI生成注释: 只有在配置编辑模式且模式有效时才允许切换
-    rsps.body.cmdletOrResponse =
-	    (this->rt_solution.configEditting && modeValid) ? true : false;
-
-//	如果当前模式和将要设置的模式相同则不进行任何操作并返回成功，
-//	如果相同则变更系统模式，并生成一个系统模式切换事件（因为这个模式切换可能引发重启或休眠）
-    // AI生成注释: 计算响应数据包的CRC校验值
-    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
-	    CFL(rsps.body));
-    // AI生成注释: 发送工作模式切换响应到服务器
-    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
-    // AI生成注释: 如果模式无效，直接返回
-    if (!modeValid)
-	return;
-    // AI生成注释: 如果新模式与当前模式相同，无需切换，直接返回
-    if (this->rt_solution.mode == *mode)
-	return;
-
-    // AI生成注释: 更新设备工作模式
     this->rt_solution.mode = *mode;
-    // AI生成注释: 传感器配置变量
     util_sc7a20_config_s sensor_config;
 
-    // AI生成注释: 根据不同工作模式配置相应参数
     switch (this->rt_solution.mode)
 	{
-    // AI生成注释: 工作模式配置
     case solution_mode_e::wm_work:
 	{
-	/*
-	 * 切换到工作模式，标定工作角度
-	 * 校正角度，持续3s
-	 */
-	// AI生成注释: 采样当前角度作为工作基准角度（30次采样，100ms间隔）
 	float sampled_angle = util_sc7a20_sample_angle(30, 100);
-	// AI生成注释: 获取当前传感器配置
 	sensor_config = util_sc7a20_get_config();
-	// AI生成注释: 设置倾斜检测的基准偏移角度
 	sensor_config.leanDetectOffset = sampled_angle;
-	// AI生成注释: 启用倾斜检测功能
 	sensor_config.leanDetectEnabled = true;
-	// AI生成注释: 应用传感器配置
 	util_sc7a20_set_config(sensor_config);
-	/*切换到主服务器*/
-	// AI生成注释: 设置连接到主服务器
 	this->rt_solution.connect_to_main_server = true;
-	/*启动时更新一次定位*/
-	// AI生成注释: 标记启动时需要更新位置信息
 	this->rt_solution.updatePositionOnStart = true;
 	}
 	break;
-    // AI生成注释: 空闲模式配置
     case solution_mode_e::wm_idle:
 	{
-	// AI生成注释: 获取当前传感器配置
 	sensor_config = util_sc7a20_get_config();
-	// AI生成注释: 禁用倾斜检测功能以节省电能
 	sensor_config.leanDetectEnabled = false;
-	// AI生成注释: 应用传感器配置
 	util_sc7a20_set_config(sensor_config);
-	/*切换到主服务器*/
-	// AI生成注释: 设置连接到主服务器
 	this->rt_solution.connect_to_main_server = true;
+	this->rt_solution.updatePositionOnStart = false;
 	}
 	break;
-    // AI生成注释: 工厂模式配置
     case solution_mode_e::wm_factory:
 	{
-	// AI生成注释: 获取当前传感器配置
 	sensor_config = util_sc7a20_get_config();
-	// AI生成注释: 禁用倾斜检测功能
 	sensor_config.leanDetectEnabled = false;
-	// AI生成注释: 应用传感器配置
 	util_sc7a20_set_config(sensor_config);
-	/*切换到主服务器*/
-	// AI生成注释: 设置连接到备用服务器（用于工厂测试）
 	this->rt_solution.connect_to_main_server = false;
+	this->rt_solution.updatePositionOnStart = false;
 	}
 	break;
     default:
-	;
+	break;
 	}
-    // AI生成注释: 保存配置到NVM
-    nvm->save();
-    // AI生成注释: 重启设备以应用新的工作模式
-    this->restart();
-//	    模式变更，保存系统然后重启
 
+    nvm->save();
+    rsps.body.cmdletOrResponse = 1; /* 功能码14：成功 */
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    /* restart() 内会再 __flash_sync；此处先刷一次保证应答前已落盘 */
+    nvm_commit_host_config();
+    this->restart();
     }
 
-#pragma GCC diagnostic pop
+/**
+ * @brief 处理服务器 OK：仅最近一次 up_report 的确认才可能休眠（对齐 Inclination）
+ */
+void Solution::message_heartbeat(void)
+    {
+    /* 引脚唤醒：OK 后继续在线搜星（勿进睡） */
+    if (util_lowpower_get_wake_source() == util_lowpower_wake_source_e::pin)
+	{
+	clear_report_pending_ack();
+	logInfo("震动唤醒收到上报 OK，继续在线");
+	return;
+	}
+
+    if (!awaiting_report_ok_)
+	{
+	logInfo("收到 OK（非 up_report 确认），继续在线");
+	return;
+	}
+
+    if (util_agnss_rx_is_active())
+	{
+	clear_report_pending_ack();
+	logInfo("AGNSS 期间收到 OK，忽略");
+	return;
+	}
+
+    awaiting_report_ok_ = false;
+
+    /* 北斗仍上电：视为搜星会话，对齐 Inclination t3 会话不因 OK 进睡 */
+    if (HAL_GPIO_ReadPin(BD_PWR_GPIO_Port, BD_PWR_Pin) == GPIO_PIN_SET)
+	{
+	logInfo("搜星中收到上报 OK，继续在线");
+	return;
+	}
+
+    logInfo("收到 up_report OK，准备休眠");
+    this->message_sleep();
+    }
+
+void Solution::mark_report_pending_ack(void)
+    {
+    awaiting_report_ok_ = true;
+    }
+
+void Solution::clear_report_pending_ack(void)
+    {
+    awaiting_report_ok_ = false;
+    }
 
 /**
  * AI生成注释: 发送消息到服务器函数
@@ -1652,12 +1762,12 @@ void Solution::message_change_execute_mode(solution_mode_e *mode)
  */
 int Solution::send_message(void *msg, uint16_t len)
     {
-    // AI生成注释: 根据连接配置选择目标服务器类型
+    /* 任意非 report 发送先清确认位；report 在发送成功后再 mark */
+    clear_report_pending_ack();
     auto connServer =
 	    this->rt_solution.connect_to_main_server ?
 		    AIR780EP::air780_server_t::server_main :
 		    AIR780EP::air780_server_t::server_aux;
-    // AI生成注释: 通过4G模块向指定服务器发送数据，无超时限制
     return air->write((char*) msg, len, portMAX_DELAY, connServer);
     }
 
@@ -1738,6 +1848,7 @@ void Solution::event_action_device_sleep(void)
     logInfo("定时器: 设备在线超时, 进入休眠");
     lbs_session_stop();
     util_atgm332d_nvm_flush();
+    clear_config_session_for_standby();
     uint32_t sleep_time = this->rt_solution.runningConfig.t0_netGood_wakeup_min
 	    * 60;
     auto lpconfig = util_lowpower_get_config();
@@ -1788,6 +1899,12 @@ void Solution::event_process(void)
 	case util_event_code_t::device_sleep_due:
 	    this->event_action_device_sleep();
 	    break;
+	case util_event_code_t::gnss_pwr_off_commit:
+	    /* t4 延时关电后：滤波已跑完，刷坐标进 Flash */
+	    util_atgm332d_nvm_flush();
+	    __flash_sync();
+	    logInfo("北斗: 关模块后坐标已落盘");
+	    break;
 	default:
 	    break;
 	    }
@@ -1827,6 +1944,7 @@ void Solution::setup_network(void)
 	lpconfig.wakeup_remain = lpconfig.requested_wakeup_period;
 	// AI生成注释: 应用低功耗配置
 	util_lowpower_set_config(lpconfig);
+	clear_config_session_for_standby();
 	// AI生成注释: LTE附着失败，进入休眠模式
 	util_lowpower_standby();/*LTE附着失败，休眠*/
 	}
@@ -1883,6 +2001,7 @@ void Solution::setup_network(void)
 	lpconfig.wakeup_remain = lpconfig.requested_wakeup_period;
 	// AI生成注释: 应用低功耗配置
 	util_lowpower_set_config(lpconfig);
+	clear_config_session_for_standby();
 	// AI生成注释: 服务器连接失败，进入休眠模式
 	util_lowpower_standby();/*LTE附着失败，休眠*/
 	}
@@ -1958,23 +2077,26 @@ void Solution::solution_work_routine_thread(void *argument)
     pthis->report();
 
     /*
-     * Standby 引脚唤醒=整机复位：不会自动产生 vibrate 事件，
-     * 且上面 flush 会丢掉联网期间的加计事件，故此处按震动路径补定位。
+     * 产品只有两类唤醒：RTC 定时 / 震动（硬件记为 pin=加计 INT）。
+     * Standby 震动唤醒=整机复位，不会自动产生 vibrate 事件，且 flush
+     * 会丢掉联网期间加计事件，故此处按震动路径补 GNSS + LBS。
      */
     if (wake == util_lowpower_wake_source_e::pin)
 	{
-	logInfo("工作例程: 引脚唤醒, 按震动路径定位");
+	logInfo("工作例程: 震动唤醒(引脚), 启动定位");
 	logInfo("工作例程: 定位开关=0x%02X",
 		(unsigned) pthis->rt_solution.locate_switch);
 	util_sc7a20_mark_vibration();
-	pthis->start_locate(true);
+	pthis->start_locate();
+	pthis->start_lbs_if_needed();
 	pthis->rt_solution.updatePositionOnStart = false;
 	pthis->nvm->save();
 	}
     else if (pthis->rt_solution.updatePositionOnStart)
 	{
-	logInfo("工作例程: 开机刷新定位(不允许LBS)");
-	pthis->start_locate(false);
+	/* RTC/上电等：只刷新 GNSS，不查 LBS */
+	logInfo("工作例程: 定时/开机刷新定位(不含LBS)");
+	pthis->start_locate();
 	pthis->rt_solution.updatePositionOnStart = false;
 	pthis->nvm->save();
 	}
@@ -2114,6 +2236,7 @@ void Solution::solution_fact_routine_thread(void *argument)
 	lpconfig.wake_pin_enable = false;
 	// AI生成注释: 应用低功耗配置
 	util_lowpower_set_config(lpconfig);
+	pthis->clear_config_session_for_standby();
 	// AI生成注释: 进入长时间休眠，等待下次自动唤醒重新检测
 	util_lowpower_standby();
 	}

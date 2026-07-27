@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Simulate Solution::start_locate for all locate_switch modes."""
+"""Simulate Solution::start_locate + start_lbs_if_needed for locate_switch modes."""
 
 MASK = 0x07
 GNSS, AGNSS, LBS = 0x01, 0x02, 0x04
@@ -11,46 +11,43 @@ def normalize(sw: int) -> int:
 
 def start_locate(
     sw: int,
-    allow_lbs: bool,
     *,
-    gnss_fixed: bool = False,
     agnss_done: bool = False,
-    agnss_rx_active: bool = False,
     air_ok: bool = True,
 ) -> list[str]:
-    """Mirror Solution.cpp start_locate branching."""
+    """Mirror Solution.cpp start_locate（仅 GNSS/AGNSS）。"""
     sw = normalize(sw)
     want_gnss = bool(sw & GNSS)
     want_agnss = bool(sw & AGNSS)
-    want_lbs = allow_lbs and bool(sw & LBS)
     steps: list[str] = []
 
-    if not want_gnss and not want_lbs:
-        steps.append("SKIP")
+    if not want_gnss:
+        steps.append("SKIP_GNSS")
         return steps
 
-    if want_gnss:
-        steps.append("GNSS_ACTIVATE")
-        steps.append("GNSS_SETTLE_500ms")
-        if want_agnss and air_ok and not agnss_done:
-            steps.append("AGNSS_FETCH_INJECT")
-        elif want_agnss and agnss_done:
-            steps.append("AGNSS_SKIP_already_done")
-        elif want_agnss and not air_ok:
-            steps.append("AGNSS_SKIP_no_air")
-
-    if want_lbs and not agnss_rx_active and (not want_gnss or not gnss_fixed):
-        if air_ok:
-            steps.append("LBS_QUERY")
-            steps.append("LBS_APPLY_GEO_IF_OK")
-        else:
-            steps.append("LBS_SKIP_no_air")
-    elif want_lbs and agnss_rx_active:
-        steps.append("LBS_SKIP_agnss_rx")
-    elif want_lbs and want_gnss and gnss_fixed:
-        steps.append("LBS_SKIP_gnss_fixed")
-
+    steps.append("GNSS_ACTIVATE")
+    steps.append("GNSS_SETTLE_500ms")
+    if want_agnss and air_ok and not agnss_done:
+        steps.append("AGNSS_FETCH_INJECT")
+    elif want_agnss and agnss_done:
+        steps.append("AGNSS_SKIP_already_done")
+    elif want_agnss and not air_ok:
+        steps.append("AGNSS_SKIP_no_air")
     return steps
+
+
+def start_lbs_if_needed(
+    sw: int,
+    *,
+    gnss_fixed: bool = False,
+) -> list[str]:
+    """Mirror Solution.cpp start_lbs_if_needed（仅震动路径调用）。"""
+    sw = normalize(sw)
+    if not bool(sw & LBS):
+        return ["LBS_SKIP_switch_off"]
+    if gnss_fixed:
+        return ["LBS_SKIP_gnss_fixed"]
+    return ["LBS_SESSION_START"]
 
 
 def locate_switch_is_valid(sw: int) -> bool:
@@ -80,22 +77,21 @@ def main() -> None:
 
     print()
     print("=" * 96)
-    print(f"{'sw':<6}{'模式':<16}{'路径':<10}{'执行步骤'}")
+    print(f"{'sw':<6}{'模式':<16}{'路径':<12}{'执行步骤'}")
     print("=" * 96)
 
-    issues: list[str] = []
-
     for sw in range(8):
-        for allow, path in [(False, "开机/定时"), (True, "震动")]:
-            # 非法配置不会写入；模拟运行时按合法开关
+        for vib, path in [(False, "RTC/开机"), (True, "震动(含引脚)")]:
             if not locate_switch_is_valid(sw):
-                print(f"0x{sw:02X}  {NAMES[sw]:<16}{path:<10}{'N/A (config rejected)':<55}")
+                print(f"0x{sw:02X}  {NAMES[sw]:<16}{path:<14}{'N/A (config rejected)'}")
                 continue
-            steps = start_locate(sw, allow)
+            steps = start_locate(sw)
+            if vib:
+                steps = steps + start_lbs_if_needed(sw)
             note = ""
-            if sw == 0x04 and not allow and steps == ["SKIP"]:
-                note = "设计: 定时路径不允许LBS"
-            print(f"0x{sw:02X}  {NAMES[sw]:<16}{path:<10}{' -> '.join(steps):<55}{note}")
+            if sw == 0x04 and not vib:
+                note = "  # LBS仅震动唤醒"
+            print(f"0x{sw:02X}  {NAMES[sw]:<16}{path:<14}{' -> '.join(steps)}{note}")
 
     print()
     print("=" * 96)
@@ -105,17 +101,17 @@ def main() -> None:
         if not locate_switch_is_valid(sw):
             print(f"  0x{sw:02X} {NAMES[sw]:<16}配置拒绝，不会应用")
             continue
-        boot = start_locate(sw, False)
-        vib = start_locate(sw, True)
+        boot = start_locate(sw)
+        vib = start_locate(sw) + start_lbs_if_needed(sw)
         if sw == 0x00:
-            v = "正常: 明确跳过"
+            v = "正常: GNSS跳过；震动也不启LBS(开关关)"
         elif sw == 0x04:
-            v = "正常: 仅震动做LBS；开机跳过"
+            v = "正常: RTC无GNSS；震动可启LBS"
         else:
             v = "正常"
         print(f"  0x{sw:02X} {NAMES[sw]:<16}{v}")
-        print(f"       开机: {' -> '.join(boot)}")
-        print(f"       震动: {' -> '.join(vib)}")
+        print(f"       RTC/开机: {' -> '.join(boot)}")
+        print(f"       震动:     {' -> '.join(vib)}")
 
 
 if __name__ == "__main__":

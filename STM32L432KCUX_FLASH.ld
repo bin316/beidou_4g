@@ -39,8 +39,10 @@ ENTRY(Reset_Handler)
 /* Highest address of the user mode stack */
 _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 
+/* STL(std::map 等)仍走 newlib malloc，不可压得过小，否则冲 MSP → HardFault */
 _Min_Heap_Size = 0x1200; /* required amount of heap */
-_Min_Stack_Size = 0x800; /* required amount of stack */
+/* FreeRTOS 下 MSP 仅异常/启动用 */
+_Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Memories definition */
 MEMORY

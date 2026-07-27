@@ -70,7 +70,8 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)28672)
+/* 在保留 newlib 4.5K 前提下尽量加大 RTOS 堆；30464 留出链接余量（曾 overflow 88B） */
+#define configTOTAL_HEAP_SIZE                    ((size_t)30464)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -80,6 +81,8 @@
 #define configUSE_COUNTING_SEMAPHORES            1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION  0
 #define configRECORD_STACK_HIGH_ADDRESS          1
+#define configCHECK_FOR_STACK_OVERFLOW           2
+#define configUSE_MALLOC_FAILED_HOOK             1
 /* USER CODE BEGIN MESSAGE_BUFFER_LENGTH_TYPE */
 /* Defaults to size_t for backward compatibility, but can be changed
  if lengths will always be less than the number of bytes in a size_t. */
@@ -94,7 +97,8 @@
 #define configUSE_TIMERS                         1
 #define configTIMER_TASK_PRIORITY                ( 45 )
 #define configTIMER_QUEUE_LENGTH                 10
-#define configTIMER_TASK_STACK_DEPTH             512
+/* 定时器回调仅投递事件/喂狗；256 偏紧，恢复 384 留余量 */
+#define configTIMER_TASK_STACK_DEPTH             384
 
 /* The following flag must be enabled only when using newlib */
 #define configUSE_NEWLIB_REENTRANT          1

@@ -138,6 +138,20 @@ typedef struct
     uint8_t item[8];
     } password;
 
+/** 功能码 9 下行：密码 + 意图功能码（dataLen=9） */
+typedef struct
+    {
+    password pwd;
+    uint8_t intentFunc; /**< 进模式：5/13/15/19/21；改密：9；退出：必须 0 */
+    } pb_configModeReq;
+
+/** 功能码 8 上行：结果 + 意图回显（失败 intent 恒 0；dataLen=2） */
+typedef struct
+    {
+    uint8_t result;
+    uint8_t intentFunc;
+    } pb_configModeRsp;
+
 typedef struct RunningConfig
     {
 //	网络连接成功时的唤醒周期	solution
@@ -309,6 +323,21 @@ typedef struct
 	uint16_t crc;
 	} body;
     } pb_packCmdletOrResponse;
+
+/** 功能码 8：配置模式应答（result + intentFunc） */
+typedef struct
+    {
+    const uint8_t prefix[3] =
+	{
+	0xFA, 0xFA, 0xFA
+	};
+    struct
+	{
+	pb_header header;
+	pb_configModeRsp configMode;
+	uint16_t crc;
+	} body;
+    } pb_packConfigModeRsp;
 
 typedef struct
     {

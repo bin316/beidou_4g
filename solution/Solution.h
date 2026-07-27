@@ -106,8 +106,10 @@ private:
     void event_action_server_report(void);
     /** Timer 投递的在线超时休眠（工作线程执行） */
     void event_action_device_sleep(void);
-    /** 按 locate_switch 启动定位；allow_lbs 仅震动/引脚唤醒为 true */
-    void start_locate(bool allow_lbs = false);
+    /** 按 locate_switch 启 GNSS/AGNSS（不含 LBS） */
+    void start_locate(void);
+    /** 震动唤醒路径调用：locateSwitch.LBS 开且北斗未定住时启 LBS 会话 */
+    void start_lbs_if_needed(void);
     /** 对齐 Slope：启 LBS 会话（满 4h 后本唤醒最多 N 次，事件循环执行） */
     void lbs_session_start(void);
     /** 对齐 Slope：处理到期的 LBS 查询/重试 */
@@ -119,7 +121,8 @@ private:
     void message_upload_run_parameters(void);
     void message_change_run_parameters(pb_runningConfig *params);
     void message_sleep(void);
-    void message_enter_config_mode(password *pwd);
+    /** 功能码 9：进/退配置模式、改密；req 为 null 或 dataLen 非法时回失败 */
+    void message_enter_config_mode(pb_configModeReq *req);
     void message_upload_sys_parameters(void);
     void message_change_sys_parameters(pb_systemConfig *params);
     void message_change_execute_mode(solution_mode_e *mode);
@@ -131,6 +134,20 @@ private:
     void message_config_locate_switch(uint8_t *value);
     /** 下行23：查询 locateSwitch */
     void message_upload_locate_switch(void);
+    /** 服务器 OK：仅 awaiting_report_ok_ 时可能休眠（对齐 Inclination） */
+    void message_heartbeat(void);
+    void mark_report_pending_ack(void);
+    void clear_report_pending_ack(void);
+
+    /** true=最近一次成功发出 up_report，下一条 OK 视为上报确认 */
+    bool awaiting_report_ok_ = false;
+
+    /** 当前配置会话意图（RAM）；进 Standby/退出时清零，不落 NVM */
+    uint8_t config_intent_ = 0;
+    /** 是否允许执行指定写功能码（配置态且 intent 匹配） */
+    bool config_write_allowed(uint8_t write_func) const;
+    /** 进 Standby 前清除配置会话，避免跨睡残留 editing 而无 intent */
+    void clear_config_session_for_standby(void);
 
 //	服务器响应超时定时器相关变量
     TimerHandle_t server_timeout_timer;

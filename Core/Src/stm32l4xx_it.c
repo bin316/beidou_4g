@@ -22,7 +22,7 @@
 #include "stm32l4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "SEGGER_RTT.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -104,6 +104,19 @@ void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
 	uint16_t counter = 0;
+	uint32_t *stack = NULL;
+	__asm volatile (
+		"tst lr, #4          \n"
+		"ite eq              \n"
+		"mrseq %0, msp       \n"
+		"mrsne %0, psp       \n"
+		: "=r" (stack)
+	);
+	/* stacked: r0 r1 r2 r3 r12 lr pc xPSR */
+	SEGGER_RTT_printf(0,
+		"HardFault PC=0x%08lX LR=0x%08lX CFSR=0x%08lX HFSR=0x%08lX\r\n",
+		(unsigned long) stack[6], (unsigned long) stack[5],
+		(unsigned long) SCB->CFSR, (unsigned long) SCB->HFSR);
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

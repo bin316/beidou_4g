@@ -136,7 +136,7 @@ AIR780EP::AIR780EP(UART_HandleTypeDef *huart)
 	nvm->save();
 	}
 
-    xTaskCreate(rxThread, "air780 rx", 512, this, osPriorityHigh,
+    xTaskCreate(rxThread, "air780 rx", 1024, this, osPriorityHigh,
 	    &this->rxTaskHandle);
     configASSERT(this->rxTaskHandle != NULL);
     }
@@ -464,6 +464,8 @@ int AIR780EP::setAutoSleepTimeout(uint32_t time)
 
 void AIR780EP::setup()
     {
+    /* 东八区：NITZ 上报本地时，与 TZ=UTC-8 + mktime 一致（对齐 Inclination） */
+    sendCmd(200, rx_content_t::__invalid, "AT+NITZDISSET=\"e\",8\r\n");
     /*enable echo*/
     sendCmd(200, rx_content_t::ATE, "ATE1\r\n");
     /*$notice always disable auto upgrade*/
@@ -675,25 +677,39 @@ void AIR780EP::rxThread(void *argument)
 	{
 	pthis->status.setup.eutran = true;
 	}
-    /*time updated*/
-    if (sv.find("+NITZ") != string_view::npos)
+    /*time updated：必须用 "+NITZ:"，勿用 "+NITZ"（会误匹配 +NITZDISSET 应答） */
+    if (sv.find("+NITZ:") != string_view::npos)
 	{
 	/*
-	 * time update passive message format is shown below, convert to time_t
-	 * "+NITZ: 25/02/05,08:33:52+32,0"
+	 * "+NITZ: 25/02/05,08:33:52+32,0"（±tz 为 1/4 小时；末尾 %d 兼容 +32/-32）
 	 */
-	struct tm timeinfo;
+	struct tm timeinfo =
+	    {
+	    };
 	int timezone = 0;
-	sscanf(&sv[sv.find("+NITZ")], "+NITZ: %d/%d/%d,%d:%d:%d+%d",
-		&timeinfo.tm_year, &timeinfo.tm_mon, &timeinfo.tm_mday,
-		&timeinfo.tm_hour, &timeinfo.tm_min, &timeinfo.tm_sec,
-		&timezone);
-	timeinfo.tm_isdst = 0;
-	timeinfo.tm_year += 100;
-	timeinfo.tm_mon -= 1;
-	pthis->status.time = mktime(&timeinfo);
-	pthis->status.time -= 3600;
-	pthis->updateLocalTime();
+	const size_t nitz_pos = sv.find("+NITZ:");
+	const int n = sscanf(sv.data() + nitz_pos,
+		"+NITZ: %d/%d/%d,%d:%d:%d%d", &timeinfo.tm_year,
+		&timeinfo.tm_mon, &timeinfo.tm_mday, &timeinfo.tm_hour,
+		&timeinfo.tm_min, &timeinfo.tm_sec, &timezone);
+	if (n >= 6)
+	    {
+	    timeinfo.tm_isdst = 0;
+	    timeinfo.tm_year += 100;
+	    timeinfo.tm_mon -= 1;
+	    /* NITZDISSET 东八区本地时 + TZ=UTC-8 → mktime 得 unix */
+	    const time_t unix_ts = mktime(&timeinfo);
+	    if (unix_ts != (time_t) -1)
+		{
+		pthis->status.time = unix_ts;
+		pthis->updateLocalTime();
+		}
+	    else
+		{
+		logWarning("4G: NITZ mktime失败 yy=%d mon=%d",
+			timeinfo.tm_year, timeinfo.tm_mon);
+		}
+	    }
 	}
     if (sv.find("C: ") != string_view::npos)
 	{
@@ -737,10 +753,16 @@ void AIR780EP::rxThread(void *argument)
     for (uint8_t i = 0; i < 3; i++)
 	{
 	char ok_pat[20];
+	char fail_pat[24];
 	snprintf(ok_pat, sizeof(ok_pat), "%u, CONNECT OK", i);
+	snprintf(fail_pat, sizeof(fail_pat), "%u, CONNECT FAIL", i);
 	if (sv.find(ok_pat) != string_view::npos)
 	    {
 	    pthis->connectionsStatus[i] = true;
+	    }
+	if (sv.find(fail_pat) != string_view::npos)
+	    {
+	    pthis->connectionsStatus[i] = false;
 	    }
 	}
     if (sv.find("+CIPSTART:") != string_view::npos)
@@ -879,8 +901,9 @@ void AIR780EP::updateLocalTime(void)
 
     if (updated)
 	return;
-//    $notice update time only once
-    time_t t = status.time;
-    util_lowpower_update_rtc(t);
-    updated = true;
+    /* 仅成功写入 RTC 后置位，避免 NITZ 解析失败后永久跳过 */
+    if (util_lowpower_update_rtc(status.time) == 0)
+	{
+	updated = true;
+	}
     }

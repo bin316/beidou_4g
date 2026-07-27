@@ -51,6 +51,7 @@
 osThreadId_t bootHandle;
 const osThreadAttr_t boot_attributes = {
   .name = "boot",
+  /* 初始化路径较重（NVM/传感器/Solution），保持 512 words */
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
@@ -127,6 +128,29 @@ __weak void boot_thread(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+#include "SEGGER_RTT.h"
+
+void vApplicationMallocFailedHook(void)
+{
+  SEGGER_RTT_printf(0, "FATAL: FreeRTOS malloc failed, free=%u\r\n",
+		    (unsigned) xPortGetFreeHeapSize());
+  taskDISABLE_INTERRUPTS();
+  for (;;)
+    {
+    }
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void) xTask;
+  SEGGER_RTT_printf(0, "FATAL: stack overflow task=%s\r\n",
+		    pcTaskName != NULL ? pcTaskName : "?");
+  taskDISABLE_INTERRUPTS();
+  for (;;)
+    {
+    }
+}
 
 /* USER CODE END Application */
 

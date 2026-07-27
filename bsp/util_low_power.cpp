@@ -80,9 +80,8 @@ void __util_lowpower_init__(void) {
 		logInfo("NVM: 已恢复出厂默认");
 	}
 
-	/*timezone setup*/
-	setenv("TZ", "UTC+1", 1); // 设置为 UTC
-//	unsetenv("TZ"); // 设置为 UTC
+	/*timezone setup：POSIX 符号与日常相反，UTC-8 = 东八区北京时间（对齐 Inclination） */
+	setenv("TZ", "UTC-8", 1);
 	tzset();             // 更新时区设置
 
 	/* 上电打印复位原因，便于区分 IWDG / SoftReset(HardFault后) / 引脚复位 */
@@ -289,32 +288,48 @@ void util_lowpower_iwdg_feed(void) {
 }
 
 /*
- * @func util_lowpower_set_rtc
- * @brief update rtc time
- * @param time: the time to set
- * @return void
- * @note always use beijing time
+ * @brief 用 unix 时间写 RTC（按当前 TZ，工程为东八区）
+ * @return 0 成功；-1 时间非法（不改 RTC）
  */
-void util_lowpower_update_rtc(time_t time) {
-	struct tm *local = localtime(&time);
+int util_lowpower_update_rtc(time_t time) {
+	/* mktime 失败为 -1；拒绝写入以免 Year 下溢成 2226 等脏值 */
+	if (time == (time_t) -1 || time < 0) {
+		logWarning("RTC: 拒绝非法时间戳 %ld", (long) time);
+		return -1;
+	}
+
+	struct tm *plocal = localtime(&time);
+	if (plocal == nullptr) {
+		logWarning("RTC: localtime 失败 时间戳 %ld", (long) time);
+		return -1;
+	}
+	struct tm local = *plocal;
+
+	/* STM32 RTC 年字段仅 0..99（2000..2099） */
+	if (local.tm_year < 100 || local.tm_year > 199) {
+		logWarning("RTC: 年份越界 tm_year=%d", local.tm_year);
+		return -1;
+	}
+
 	RTC_TimeTypeDef sTime;
 	RTC_DateTypeDef sDate;
 
-	sTime.Hours = local->tm_hour;
-	sTime.Minutes = local->tm_min;
-	sTime.Seconds = local->tm_sec;
+	sTime.Hours = (uint8_t) local.tm_hour;
+	sTime.Minutes = (uint8_t) local.tm_min;
+	sTime.Seconds = (uint8_t) local.tm_sec;
 
-	sDate.WeekDay = local->tm_wday;
-	sDate.Month = local->tm_mon + 1;
-	sDate.Date = local->tm_mday;
-	sDate.Year = local->tm_year - 100;
+	sDate.WeekDay = (uint8_t) local.tm_wday;
+	sDate.Month = (uint8_t) (local.tm_mon + 1);
+	sDate.Date = (uint8_t) local.tm_mday;
+	sDate.Year = (uint8_t) (local.tm_year - 100);
 
 	logInfo("RTC: 已设置 %02d:%02d:%02d %02d/%02d/%02d", sTime.Hours,
 			sTime.Minutes, sTime.Seconds, sDate.Year + 2000, sDate.Month,
 			sDate.Date);
-	logInfo("RTC: 时间戳 %ld", (long)time);
+	logInfo("RTC: 时间戳 %ld", (long) time);
 	HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 	HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+	return 0;
 }
 
 time_t util_lowpower_get_rtc(void) {

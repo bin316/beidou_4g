@@ -77,9 +77,54 @@ static int32_t deactivate_hysteresis = 0;
 static bool updated_since_activate = false;
 /** 本唤醒 LBS 至少成功一次（geoStat；与 GNSS position_fixed 分开，对齐 Slope） */
 static bool lbs_ok_this_wake_ = false;
+/** 页缓冲有未刷 Flash 的坐标变更（对齐 Slope gnss_nvm_dirty_） */
 static bool nvm_dirty_ = false;
+/** 本会话是否已把首点写入页缓冲（对齐 Slope gnss_nvm_first_persist_done_） */
+static bool nvm_first_persist_done_ = false;
 
 TimerHandle_t deactivate_timer = NULL;
+
+/**
+ * 关模块定时器回调（对齐 Inclination 7816fd9 / Slope）
+ * 仅断电并投递落盘事件；禁止 xTimerDelete / Flash：喂狗与本回调同属 Timer 守护任务。
+ */
+static void bd_deact_timer_callback(TimerHandle_t xtimer) {
+	(void) xtimer;
+	updated_since_activate = false;
+	deactivate_hysteresis = 0;
+	HAL_GPIO_WritePin(BD_PWR_GPIO_Port, BD_PWR_Pin, GPIO_PIN_RESET);
+	/* 滤波窗口已在 t4 内更新；关电后由 solution_work 刷 Flash */
+	util_events_generate_noblock(util_event_code_t::gnss_pwr_off_commit);
+}
+
+/**
+ * 坐标写入 NVM 页缓冲（RAM），不擦写 Flash。
+ * 落盘时不把 position_fixed/sats 写入 Flash（对齐 Slope gnss_nvm_persist_to_buffer）。
+ */
+static void atgm332d_nvm_persist_to_buffer(void) {
+	if (nvm_atgm332d == nullptr) {
+		return;
+	}
+	const int fixed = status.position_fixed;
+	const uint8_t sats = status.sats;
+	status.position_fixed = false;
+	status.sats = 0;
+	nvm_atgm332d->save();
+	status.position_fixed = fixed;
+	status.sats = sats;
+}
+
+/**
+ * 坐标更新：运行中只维护页缓冲/dirty；Flash 在关模块或上位机改参时刷（本函数不 sync）。
+ */
+static void atgm332d_nvm_on_geo_updated(void) {
+	nvm_dirty_ = true;
+	if (!nvm_first_persist_done_) {
+		atgm332d_nvm_persist_to_buffer();
+		nvm_first_persist_done_ = true;
+		nvm_dirty_ = false;
+	}
+}
 
 /* 加权平均滤波：lat_buf[0]最旧、[count-1]最新，权重1~count */
 static float lat_buf[GNSS_FILTER_N];
@@ -130,9 +175,6 @@ static void atgm332d_rx_thread(void *argument) {
 	uint16_t read_len = uart->read(buffer, kNmeaRxBuf, 100);
 	if (read_len <= 0)
 		goto loop;
-
-	//将原始NMEA数据通过串口1回显
-	//HAL_UART_Transmit(&huart1, (uint8_t*)buffer, read_len, 100);
 
 	/* 解析 GGA 获取卫星数量，本帧解析成功则 sats 与 RMC 同源 */
 	bool gga_parsed_this_frame = false;
@@ -194,27 +236,24 @@ static void atgm332d_rx_thread(void *argument) {
 		if (accepted) {
 			status.time = rmc->unixTime;
 			status.position_fixed = true;
-			nvm_atgm332d->save();
+			/* Slope：只写页缓冲 / 标 dirty，绝不在 RX 里 Erase/Program Flash */
+			atgm332d_nvm_on_geo_updated();
 			/* 不用 %f：newlib 浮点格式化栈大，RX 任务易溢出；单位=1e-4度 */
 			logInfo("北斗定位已更新: lon_e4=%ld lat_e4=%ld 时间戳=%ld",
 				(long) (status.longitude * 10000.0f),
 				(long) (status.latitude * 10000.0f),
 				(long) status.time);
 
-			/*激活后首次更新*/
+			/* 本会话首次定住：复用定时器延时关电（回调内禁止 Delete/Flash） */
 			if (!updated_since_activate) {
-				if (deactivate_timer == NULL) {
-					deactivate_hysteresis =
-							deactivate_hysteresis <= 0 ? 1 : deactivate_hysteresis;
-					deactivate_timer = xTimerCreate("bd_deact",
-							pdMS_TO_TICKS(deactivate_hysteresis * 1000), pdFALSE,
-							NULL, [](TimerHandle_t xtimer) {
-								util_atgm332d_deactivate();
-								xTimerDelete(xtimer, portMAX_DELAY);
-								deactivate_timer = NULL;
-							});
-				}
 				updated_since_activate = true;
+				const uint32_t off_sec =
+					(deactivate_hysteresis == 0) ? 3u : (uint32_t) deactivate_hysteresis;
+				if (deactivate_timer != NULL) {
+					(void) xTimerChangePeriod(deactivate_timer,
+							pdMS_TO_TICKS(off_sec * 1000u), portMAX_DELAY);
+					logInfo("北斗: 定位成功, %us后关闭模块", (unsigned) off_sec);
+				}
 			}
 		}
 	}
@@ -231,6 +270,11 @@ void __util_atgm332d_init__(void) {
 	configASSERT(nvm_atgm332d != nullptr);
 
 	util_atgm332d_load();
+
+	/* 关模块定时器只创建一次，activate/定住时 Stop/ChangePeriod 复用 */
+	deactivate_timer = xTimerCreate("bd_deact", pdMS_TO_TICKS(3000), pdFALSE,
+			NULL, bd_deact_timer_callback);
+	configASSERT(deactivate_timer != NULL);
 
 	/* 对齐 Slope gnss_task=1024：NMEA 解析 + 偶发日志，512 易 HardFault */
 	xTaskCreate(atgm332d_rx_thread, "atgm332d rx", 1024, NULL, osPriorityHigh,
@@ -255,6 +299,7 @@ void util_atgm332d_load(void) {
 	status.position_fixed = false;
 	lbs_ok_this_wake_ = false;
 	nvm_dirty_ = false;
+	nvm_first_persist_done_ = false;
 }
 
 util_atgm332d_status_t util_atgm332d_get_status(void) {
@@ -264,6 +309,7 @@ util_atgm332d_status_t util_atgm332d_get_status(void) {
 void util_atgm332d_wake_session_begin(void) {
 	lbs_ok_this_wake_ = false;
 	nvm_dirty_ = false;
+	nvm_first_persist_done_ = false;
 }
 
 bool util_atgm332d_lbs_interval_elapsed(void) {
@@ -309,33 +355,48 @@ void util_atgm332d_nvm_flush(void) {
 	if (!nvm_dirty_ || nvm_atgm332d == nullptr) {
 		return;
 	}
-	nvm_atgm332d->save();
+	atgm332d_nvm_persist_to_buffer();
 	nvm_dirty_ = false;
+}
+
+/** 停止关模块定时器（不 Delete，句柄永久复用） */
+static void atgm332d_stop_deactivate_timer(void) {
+	if (deactivate_timer == NULL) {
+		return;
+	}
+	(void) xTimerStop(deactivate_timer, 0);
 }
 
 /*
  * @func util_atgm332d_activate
- * @param hysteresis uint32_t
- * @return void
- * @brief 激活北斗模块, hysteresis表示自动掉线迟滞，当北斗数据首次刷新后，延迟这个秒数后关闭北斗模块
+ * @param hysteresis_sec 首次定住后延迟关模块秒数；0 按 3s（对齐 Inclination t4）
+ * @brief 上电北斗；已上电则刷新迟滞并重新等待「本会话首次定住」
  */
 void util_atgm332d_activate(uint32_t hysteresis_sec) {
-	/*不重复激活*/
-	if (HAL_GPIO_ReadPin(BD_PWR_GPIO_Port, BD_PWR_Pin) == GPIO_PIN_SET)
-		return;
-	HAL_GPIO_WritePin(BD_PWR_GPIO_Port, BD_PWR_Pin, GPIO_PIN_SET);
-	deactivate_hysteresis = hysteresis_sec;
+	atgm332d_stop_deactivate_timer();
+	/* 与 Inclination：t4==0 时兜底 3s */
+	deactivate_hysteresis = (hysteresis_sec == 0u) ? 3 : (int32_t) hysteresis_sec;
 	updated_since_activate = false;
+	nvm_first_persist_done_ = false;
 	filter_count = 0; /* 清空滤波缓冲，仅在同次唤醒内滤波 */
+	if (HAL_GPIO_ReadPin(BD_PWR_GPIO_Port, BD_PWR_Pin) != GPIO_PIN_SET) {
+		HAL_GPIO_WritePin(BD_PWR_GPIO_Port, BD_PWR_Pin, GPIO_PIN_SET);
+	}
 }
 
 /*
  * @func util_atgm332d_deactivate
- * @param void
- * @return void
- * @brief 立即关闭北斗模块
+ * @brief 立即关闭北斗：停定时器、坐标写入页缓冲并刷 Flash、断电
+ * @note  须在任务上下文调用（禁止 Timer 回调）
  */
 void util_atgm332d_deactivate(void) {
+	atgm332d_stop_deactivate_timer();
+	if (nvm_dirty_ || nvm_first_persist_done_) {
+		atgm332d_nvm_persist_to_buffer();
+		nvm_dirty_ = false;
+		__flash_sync();
+		logInfo("北斗: 关模块后坐标已落盘");
+	}
 	HAL_GPIO_WritePin(BD_PWR_GPIO_Port, BD_PWR_Pin, GPIO_PIN_RESET);
 	vTaskDelay(pdMS_TO_TICKS(50));
 	updated_since_activate = false;
@@ -371,7 +432,9 @@ bool util_atgm332d_set_manual_geo(float lon, float lat) {
 }
 
 /**
- * @brief LBS 写经纬度：本周期 lbs_ok（geoStat），不置 GNSS position_fixed；延迟落盘
+ * @brief LBS 落点策略：有 NVM 历史且距 LBS ≤门限则保留旧点(geoStat=0)；
+ *        否则写 LBS(geoStat=1)。不置 GNSS position_fixed；写坐标时延迟落盘。
+ * @return GNSS 已 fix 时 false；keep/apply 均为 true（本查询已处理）
  */
 bool util_atgm332d_apply_lbs_geo(float lon, float lat) {
 	/* 查询返回时若 GNSS 已 fix，丢弃 LBS 坐标（对齐 Slope） */
@@ -379,14 +442,31 @@ bool util_atgm332d_apply_lbs_geo(float lon, float lat) {
 		logInfo("北斗: LBS坐标丢弃(北斗已定位)");
 		return false;
 	}
+
+	const bool has_nvm = (status.longitude != 0.f || status.latitude != 0.f);
+	if (has_nvm) {
+		const float dist_m = gnss_distance_m(lat, lon, status.latitude,
+			status.longitude);
+		logInfo("北斗: LBS相对NVM距离=%ldm (门限=%ldm)",
+			(long) dist_m, (long) PROD_CFG_LBS_NVM_KEEP_MAX_M);
+		/* ≤1km：视为未移动，沿用历史坐标，geoStat 保持 0 */
+		if (dist_m <= PROD_CFG_LBS_NVM_KEEP_MAX_M) {
+			logInfo("北斗: LBS未改坐标(保留NVM) lon_e4=%ld lat_e4=%ld",
+				(long) (status.longitude * 10000.0f),
+				(long) (status.latitude * 10000.0f));
+			return true;
+		}
+	}
+
 	status.longitude = lon;
 	status.latitude = lat;
 	status.sats = 0;
 	status.time = util_lowpower_get_rtc();
 	lbs_ok_this_wake_ = true;
 	nvm_dirty_ = true;
-	logInfo("北斗: 应用LBS坐标 lon_e4=%ld lat_e4=%ld",
-		(long) (lon * 10000.0f), (long) (lat * 10000.0f));
+	logInfo("北斗: 应用LBS坐标 lon_e4=%ld lat_e4=%ld%s",
+		(long) (lon * 10000.0f), (long) (lat * 10000.0f),
+		has_nvm ? " (超门限)" : " (无NVM历史)");
 	return true;
 }
 
@@ -441,6 +521,10 @@ bool util_atgm332d_inject_casbin(const uint8_t *data, size_t len,
 		return false;
 	}
 	const bool ok = util_atgm332d_casbin_stream_write(data, len, inter_chunk_ms);
+	/* 注入期间 RX 暂停，硬件仍可能积二进制；恢复 Idle-DMA 前再冲掉，避免 NMEA 误解析 HardFault */
+	uint32_t flush_arg = 0;
+	(void) uart->ioctl(BufferedUart::_flush_rx, &flush_arg);
+	vTaskDelay(pdMS_TO_TICKS(20));
 	(void) uart->ioctl(BufferedUart::_rx_resume, nullptr);
 	if (!ok) {
 		return false;

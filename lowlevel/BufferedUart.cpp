@@ -7,16 +7,57 @@
 
 #include <BufferedUart.h>
 
-#include "map"
-
 #include "magic_enum.hpp"
 
 #include "stdarg.h"
 using namespace magic_enum;
-using namespace std;
 
-//a map for storing the linkage between BufferedUart instance and huart
-static map<UART_HandleTypeDef*, BufferedUart*> uart_map;
+/** 静态表代替 std::map：ISR 内禁止 map::operator[]（会 newlib malloc → HardFault） */
+#define MAX_BUFFERED_UART_NUM 4
+struct BufferedUartMapEntry {
+	UART_HandleTypeDef *handle;
+	BufferedUart *instance;
+};
+static BufferedUartMapEntry uart_map_array[MAX_BUFFERED_UART_NUM] = {};
+
+static BufferedUart *find_buffered_uart(UART_HandleTypeDef *handle)
+    {
+    for (int i = 0; i < MAX_BUFFERED_UART_NUM; ++i)
+	{
+	if (uart_map_array[i].handle == handle)
+	    {
+	    return uart_map_array[i].instance;
+	    }
+	}
+    return nullptr;
+    }
+
+static bool add_buffered_uart(UART_HandleTypeDef *handle, BufferedUart *instance)
+    {
+    for (int i = 0; i < MAX_BUFFERED_UART_NUM; ++i)
+	{
+	if (uart_map_array[i].handle == nullptr)
+	    {
+	    uart_map_array[i].handle = handle;
+	    uart_map_array[i].instance = instance;
+	    return true;
+	    }
+	}
+    return false;
+    }
+
+static void remove_buffered_uart(UART_HandleTypeDef *handle)
+    {
+    for (int i = 0; i < MAX_BUFFERED_UART_NUM; ++i)
+	{
+	if (uart_map_array[i].handle == handle)
+	    {
+	    uart_map_array[i].handle = nullptr;
+	    uart_map_array[i].instance = nullptr;
+	    return;
+	    }
+	}
+    }
 
 BufferedUart::BufferedUart(UART_HandleTypeDef *huart, size_t tx_buffer_size,
 		size_t rx_buffer_size, size_t tx_dma_size, size_t rx_dma_size) {
@@ -47,7 +88,7 @@ BufferedUart::BufferedUart(UART_HandleTypeDef *huart, size_t tx_buffer_size,
 	configASSERT(rx_sem != NULL);
 
 //	update linkage
-	uart_map[huart] = this;
+	configASSERT(add_buffered_uart(huart, this));
 
 //	callbacks register
 	HAL_UART_RegisterCallback(phuart, HAL_UART_ERROR_CB_ID, isr_uart_error);
@@ -71,7 +112,7 @@ BufferedUart::~BufferedUart() {
 	vSemaphoreDelete(rx_sem);
 	vTaskDelete(uart_thread_handle);
 //	update linkage
-	uart_map.erase(phuart);
+	remove_buffered_uart(phuart);
 }
 
 #define UART_NOTIFY_TX_COMPLETE 0x00000001 << 0
@@ -81,38 +122,43 @@ BufferedUart::~BufferedUart() {
 
 void BufferedUart::isr_uart_rti(UART_HandleTypeDef *uart, uint16_t pos) {
 	BaseType_t mustYield = false;
+	BufferedUart *inst = find_buffered_uart(uart);
 //	record the receiced size
 //	ignore event if task is not created
-	if (uart_map[uart]->uart_thread_handle == NULL)
+	if (inst == nullptr || inst->uart_thread_handle == NULL)
 		return;
-	if (uart_map[uart]->rx_paused_)
+	if (inst->rx_paused_)
 		return;
-	uart_map[uart]->received_size = pos;
-	xTaskNotifyFromISR(uart_map[uart]->uart_thread_handle,
+	inst->received_size = pos;
+	xTaskNotifyFromISR(inst->uart_thread_handle,
 			UART_NOTIFY_RX_COMPLETE, eSetBits, &mustYield);
 	portYIELD_FROM_ISR(mustYield);
 }
 
 void BufferedUart::isr_uart_error(UART_HandleTypeDef *uart) {
 //	errors are not transmitted to thread anymore, just clear the flags, and continue to receive here
+	BufferedUart *inst = find_buffered_uart(uart);
 	__HAL_UNLOCK(uart);
 	__HAL_UART_CLEAR_IDLEFLAG(uart);
 	__HAL_UART_CLEAR_PEFLAG(uart);
 	__HAL_UART_CLEAR_FEFLAG(uart);
 	__HAL_UART_CLEAR_NEFLAG(uart);
 	__HAL_UART_CLEAR_OREFLAG(uart);
-	if (uart_map[uart]->rx_paused_)
+	if (inst == nullptr || inst->rx_paused_)
 		return;
-	HAL_UARTEx_ReceiveToIdle_DMA(uart, uart_map[uart]->rx_dma_buffer,
-			uart_map[uart]->rx_dma_size);
+	HAL_UARTEx_ReceiveToIdle_DMA(uart, inst->rx_dma_buffer,
+			inst->rx_dma_size);
 }
 
 static uint16_t debug_tx_cnt = 0;
 
 void BufferedUart::isr_uart_tx_complete(UART_HandleTypeDef *uart) {
 	BaseType_t mustYield = false;
+	BufferedUart *inst = find_buffered_uart(uart);
 	//	ignore event if task is not created
-	xTaskNotifyFromISR(uart_map[uart]->uart_thread_handle,
+	if (inst == nullptr || inst->uart_thread_handle == NULL)
+		return;
+	xTaskNotifyFromISR(inst->uart_thread_handle,
 			UART_NOTIFY_TX_COMPLETE, eSetBits, &mustYield);
 	portYIELD_FROM_ISR(mustYield);
 	debug_tx_cnt++;

@@ -65,6 +65,8 @@ typedef enum : uint32_t {
 	server_report_due,
 	/** 设备在线超时：仅投递，由工作线程执行 standby */
 	device_sleep_due,
+	/** 北斗延时关电完成：工作线程 flush 坐标并 __flash_sync（勿在 Timer 回调擦 Flash） */
+	gnss_pwr_off_commit,
 } util_event_code_t;
 
 /**
@@ -80,6 +82,11 @@ void __util_events_init__(void);
  * @param code Event code to generate.
  */
 void util_events_generate(util_event_code_t code);
+
+/**
+ * @brief 非阻塞投递事件（Timer 回调用，超时 0，避免堵死喂狗任务）
+ */
+void util_events_generate_noblock(util_event_code_t code);
 
 /**
  * @brief Poll for events and retrieve the event code.
@@ -115,7 +122,8 @@ void util_lowpower_set_config(util_lowpower_config_s config);
 void util_lowpower_generate_fault_reboot(uint8_t fault_code);
 void util_lowpower_iwdg_feed(void);
 time_t util_lowpower_get_rtc(void);
-void util_lowpower_update_rtc(time_t time);
+/** @return 0 成功；-1 时间非法（不改 RTC） */
+int util_lowpower_update_rtc(time_t time);
 
 /*					misc					*/
 int util_misc_string_to_float(const char *str, float *out);
@@ -432,7 +440,9 @@ typedef struct {
 
 void __util_atgm332d_init__(void);
 void util_atgm332d_load(void);
+/** 上电北斗；hysteresis_sec=首次定住后关模块秒数（建议传 t4；0→3s） */
 void util_atgm332d_activate(uint32_t hysteresis_sec);
+/** 立即关北斗电源并取消延时关电定时器 */
 void util_atgm332d_deactivate(void);
 void util_atgm332d_clear_fix_flag(void);
 /** 新唤醒周期：清本周期 LBS 成功标志（对齐 Slope sys_gnss_nvm_session_begin） */
@@ -449,7 +459,10 @@ bool util_atgm332d_geo_valid_for_report(void);
 void util_atgm332d_nvm_flush(void);
 /** 服务器写入经纬度（持久化到北斗 NVM，供后续上报使用） */
 bool util_atgm332d_set_manual_geo(float lon, float lat);
-/** LBS 成功写经纬度；本周期 geoStat=1，不立刻擦 Flash（对齐 Slope） */
+/**
+ * @brief LBS 落点：有 NVM 历史且距离≤PROD_CFG_LBS_NVM_KEEP_MAX_M 则保留旧点(geoStat=0)；
+ *        否则写入 LBS(geoStat=1)。GNSS 已 fix 时丢弃。不立刻擦 Flash。
+ */
 bool util_atgm332d_apply_lbs_geo(float lon, float lat);
 /** 向北斗 UART 注入 CASBIN（AGNSS，整段） */
 bool util_atgm332d_inject_casbin(const uint8_t *data, size_t len,

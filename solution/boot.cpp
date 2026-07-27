@@ -81,6 +81,9 @@ extern "C" void boot_thread(void *argument) {
 	 * 		不受影响
 	 */
     sol = new Solution();
+	logInfo("堆: 启动后剩余 %u / 总计 %u",
+		(unsigned) xPortGetFreeHeapSize(),
+		(unsigned) configTOTAL_HEAP_SIZE);
 //    $notice 此处可以结束boot线程了，解决方案已经启动
 //	testu = new Xuart(&huart2);
 //	testu->open();

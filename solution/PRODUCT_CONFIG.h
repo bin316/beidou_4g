@@ -87,7 +87,7 @@
 /** 北斗上电后、拉 AGNSS 前的稳定等待（ms） */
 #define PROD_CONFIG_AGNSS_PWR_SETTLE_MS                             (500u)
 
-/** LBS：合宙 AT+CIPGSMLOC；仅震动/引脚路径 allow_lbs 时启会话（对齐 Slope） */
+/** LBS：合宙 AT+CIPGSMLOC；仅震动唤醒（加计INT/在线震动事件）且开关开时启会话 */
 #define PROD_CFG_LBS_QUERY_TIMEOUT_MS                               (35000u)
 #define PROD_CFG_LBS_MIN_CSQ                                        (10)
 /** 合宙免费单基站最小查询间隔（s）；4h=14400；未到点则本唤醒不启 LBS 会话 */
@@ -97,5 +97,7 @@
 /** 失败重试 / CSQ·AGNSS 暂不可查时的改期间隔（s） */
 #define PROD_CFG_LBS_RETRY_INTERVAL_SEC                             (10u)
 #define PROD_CFG_LBS_PDP_CID                                        (1)
+/** LBS 与 NVM 历史点距离≤该值(米)时保留 NVM、geoStat=0；更大则写入 LBS */
+#define PROD_CFG_LBS_NVM_KEEP_MAX_M                                 (1000.f)
 
 #endif /* PRODUCT_CONFIG_H_ */

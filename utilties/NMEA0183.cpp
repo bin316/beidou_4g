@@ -57,9 +57,11 @@ int NMEA0183::parseSysType(void)
 
 bool NMEA0183::parseRmcMessage()
     {
-    /*将sv的范围限定到rmc句子内，如果不存在，返回-1*/
-
-    size_t rmcSentenceBegin = sv.rfind("$", sv.find("RMC"));
+    /* 必须先确认存在 RMC：find("RMC")==npos 时 rfind("$",npos) 会误匹配其它 $ */
+    size_t rmcPos = sv.find("RMC");
+    if (rmcPos == string_view::npos)
+	return false;
+    size_t rmcSentenceBegin = sv.rfind("$", rmcPos);
     if (rmcSentenceBegin == string_view::npos)
 	return false;
     size_t rmcSentenceEnd = sv.find("\r\n", rmcSentenceBegin);
@@ -73,8 +75,11 @@ bool NMEA0183::parseRmcMessage()
     this->msgView = sentence;
     parseSysType();
     this->message.content = RMC_t();
-    this->paramView = string_view(&msgView[msgView.find(",") + 1],
-	    msgView.find("*") - msgView.find(",") - 1);
+    size_t comma = msgView.find(",");
+    size_t star = msgView.find("*");
+    if (comma == string_view::npos || star == string_view::npos || star <= comma + 1)
+	return false;
+    this->paramView = string_view(msgView.data() + comma + 1, star - comma - 1);
     return parseRMC();
     }
 
@@ -98,8 +103,11 @@ bool NMEA0183::parseGgaMessage()
     this->msgView = sentence;
     parseSysType();
     this->message.content = GGA_t();
-    this->paramView = string_view(&msgView[msgView.find(",") + 1],
-	    msgView.find("*") - msgView.find(",") - 1);
+    size_t comma = msgView.find(",");
+    size_t star = msgView.find("*");
+    if (comma == string_view::npos || star == string_view::npos || star <= comma + 1)
+	return false;
+    this->paramView = string_view(msgView.data() + comma + 1, star - comma - 1);
     return parseGGA();
     }
 
@@ -126,45 +134,50 @@ bool NMEA0183::parseGGA(void)
     if (numSv > 24)
 	numSv = 24;
     auto gga = getContent<GGA_t>();
+    if (gga == nullptr)
+	return false;
     gga->satelliteCount = (uint8_t) numSv;
     return true;
     }
 
+/**
+ * @brief NMEA 异或校验；缺起始符/星号或越界一律失败
+ * @note AGNSS 注入后 RX 常夹杂二进制，不可对 string_view::npos 做下标访问
+ */
 bool NMEA0183::checkSum(string_view sentence)
     {
-    /*assuming that sentence has been limited after $ and before<CR><LF>*/
-    if (sentence.data() == NULL)
+    if (sentence.data() == NULL || sentence.empty())
+	return false;
+
+    size_t dollar = sentence.find("$");
+    size_t star = sentence.find('*');
+    if (dollar == string_view::npos || star == string_view::npos)
+	return false;
+    if (star + 2 >= sentence.size() || star <= dollar + 1)
 	return false;
 
     int chksum_original = 0;
-    uint8_t chksum_actual = 0;
-
-    /*find position*/
-    const char *chksumPos = (&sentence[sentence.find('*')]);
-    if (chksumPos == NULL)
+    if (sscanf(sentence.data() + star + 1, "%x", &chksum_original) < 1)
 	return false;
-    chksumPos++;
-    /*parse check sum*/
-    sscanf(chksumPos, "%x", &chksum_original);
 
-    /*calculate check sum*/
-    for (size_t i = sentence.find("$") + 1; i < sentence.find("*"); i++)
-	chksum_actual ^= sentence[i];
+    uint8_t chksum_actual = 0;
+    for (size_t i = dollar + 1; i < star; i++)
+	chksum_actual ^= static_cast<uint8_t>(sentence[i]);
 
-    if (chksum_actual == chksum_original)
-	return true;
-    return false;
+    return chksum_actual == static_cast<uint8_t>(chksum_original);
     }
 
 bool NMEA0183::parseRMC(void)
     {
-    if (this->sv.data() == NULL)
+    if (this->sv.data() == NULL || this->paramView.data() == NULL)
 	return false;
     std::string_view pv = this->paramView;
     const char *ff_ = "%f";
     const char *if_ = "%d";
     const char *cf_ = "%c";
     auto rmc = getContent<RMC_t>();
+    if (rmc == nullptr)
+	return false;
 
     using nmea_param = variant<float, char, int>;
     struct
@@ -205,25 +218,34 @@ bool NMEA0183::parseRMC(void)
     int result = 0;
     for (int i = 0; i < 9; i++)
 	{
+	if (pv.data() == nullptr || pv.empty())
+	    return false;
 	if (params[i].format == ff_)
 	    {
-	    float temp;
+	    float temp = 0.f;
 	    result += sscanf(pv.data(), params[i].format, &temp);
 	    params[i].param = temp;
 	    }
 	else if (params[i].format == cf_)
 	    {
-	    char temp;
+	    char temp = 0;
 	    result += sscanf(pv.data(), params[i].format, &temp);
 	    params[i].param = temp;
 	    }
 	else if (params[i].format == if_)
 	    {
-	    int temp;
+	    int temp = 0;
 	    result += sscanf(pv.data(), params[i].format, &temp);
 	    params[i].param = temp;
 	    }
-	pv = string_view(&pv[pv.find(",") + 1], pv.size() - pv.find(",") - 1);
+	/* 末字段后可能无逗号；缺逗号时禁止 pv[npos]（AGNSS 残留/残帧会 HardFault） */
+	if (i < 8)
+	    {
+	    size_t comma = pv.find(",");
+	    if (comma == string_view::npos || comma + 1 > pv.size())
+		return false;
+	    pv = string_view(pv.data() + comma + 1, pv.size() - comma - 1);
+	    }
 	}
     char valid = get<char>(params[1].param);
     if (valid != 'A')

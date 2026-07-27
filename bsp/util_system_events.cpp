@@ -42,6 +42,19 @@ void util_events_generate(util_event_code_t code) {
 	}
 }
 
+void util_events_generate_noblock(util_event_code_t code) {
+	if (event_queue == NULL) {
+		return;
+	}
+	if (xPortIsInsideInterrupt()) {
+		BaseType_t hpw = pdFALSE;
+		(void) xQueueSendFromISR(event_queue, &code, &hpw);
+		portYIELD_FROM_ISR(hpw);
+	} else {
+		(void) xQueueSend(event_queue, &code, 0);
+	}
+}
+
 bool util_events_poll(util_event_code_t *code, size_t timeout) {
 	return xQueueReceive(event_queue, code, pdMS_TO_TICKS(timeout));
 }
