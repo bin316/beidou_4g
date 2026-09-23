@@ -207,10 +207,64 @@ static uint8_t locate_switch_normalize(uint8_t locate_switch)
     }
 
 /** 上位机改参：各分区已 save 进页缓冲后，统一擦写 Flash（对齐 Slope 应答前 sync） */
-static void nvm_commit_host_config(void)
+static bool nvm_commit_host_config(void)
     {
-    __flash_sync();
-    logInfo("NVM: 上位机配置已刷入Flash");
+    const bool ok = __flash_sync();
+    logInfo("NVM: 上位机配置%s刷入Flash", ok ? "已" : "未能");
+    return ok;
+    }
+
+bool Solution::endpoint_switch_endpoint_valid(const uint8_t ip[4],
+	uint16_t port) const
+    {
+    if (port == 0u || ip == nullptr)
+	{
+	return false;
+	}
+    const bool all_zero = ip[0] == 0u && ip[1] == 0u && ip[2] == 0u
+	    && ip[3] == 0u;
+    const bool all_broadcast = ip[0] == 255u && ip[1] == 255u
+	    && ip[2] == 255u && ip[3] == 255u;
+    const bool loopback = ip[0] == 127u;
+    const bool multicast = ip[0] >= 224u && ip[0] <= 239u;
+    return !(all_zero || all_broadcast || loopback || multicast);
+    }
+
+bool Solution::endpoint_switch_connect(AIR780EP::air780_server_t server,
+	uint8_t attempts)
+    {
+    return air->connect(server, PROD_CFG_ENDPOINT_SWITCH_ATTEMPT_TIMEOUT_MS,
+	    attempts, PROD_CFG_ENDPOINT_SWITCH_RETRY_INTERVAL_MS);
+    }
+
+void Solution::endpoint_switch_pause_timers(bool *server_was_active,
+	bool *device_was_active)
+    {
+    *server_was_active = server_timeout_timer != nullptr
+	&& xTimerIsTimerActive(server_timeout_timer) != pdFALSE;
+    *device_was_active = device_timeout_timer != nullptr
+	&& xTimerIsTimerActive(device_timeout_timer) != pdFALSE;
+    if (*server_was_active)
+	{
+	xTimerStop(server_timeout_timer, portMAX_DELAY);
+	}
+    if (*device_was_active)
+	{
+	xTimerStop(device_timeout_timer, portMAX_DELAY);
+	}
+    }
+
+void Solution::endpoint_switch_resume_timers(bool server_was_active,
+	bool device_was_active)
+    {
+    if (server_was_active)
+	{
+	xTimerReset(server_timeout_timer, portMAX_DELAY);
+	}
+    if (device_was_active)
+	{
+	xTimerReset(device_timeout_timer, portMAX_DELAY);
+	}
     }
 
 /** 进配置模式允许的意图：随后要写的下行功能码（不含改密 9） */
@@ -375,6 +429,18 @@ Solution::Solution()
 	}
     logInfo("震动消抖: %u秒",
 	    (unsigned) this->rt_solution.runningConfig.t5_motionDetect_delay_sec);
+    }
+
+    /* n1 与上报 vbat 同为 0.1V；低电判断见 util_analog_is_low_battery */
+    {
+    util_analog_config_s analog_config = util_analog_get_config();
+    const uint8_t thr_01v =
+	    this->rt_solution.runningConfig.n1_vbatAlarm_threshold_volt;
+    if ((uint8_t) lroundf(analog_config.low_battery_threshold) != thr_01v)
+	{
+	analog_config.low_battery_threshold = (float) thr_01v;
+	util_analog_set_config(analog_config);
+	}
     }
 
     // // AI生成注释: 强制设置IP和端口，确保使用宏定义的值
@@ -562,12 +628,13 @@ static void log_report_packet(const pb_packReport *pkt)
 	    (s_last_hex_tick == 0)
 		    || ((now - s_last_hex_tick) >= pdMS_TO_TICKS(2000));
 
-    logInfo(
-	    "上报字段: 时间=%lu 坐标_e4=[%ld,%ld] 状态=0x%02X 加速度=[%d,%d,%d] 倾角=%d 电压=%u 温度=%d CSQ=%u 卫星=%u",
+	logInfo(
+	    "上报字段: 时间=%lu 坐标_e4=[%ld,%ld] 来源=%u 状态=0x%02X 加速度=[%d,%d,%d] 倾角=%d 电压=%u 温度=%d CSQ=%u 卫星=%u",
 	    (unsigned long) pkt->body.report.time,
 	    (long) (pkt->body.report.geo[ID_LONGITUDE] * 10000.0f),
 	    (long) (pkt->body.report.geo[ID_LATITUDE] * 10000.0f),
-	    pkt->body.report.status, pkt->body.report.acc[ID_AXIS_X],
+	    (unsigned) pkt->body.report.geo_source, pkt->body.report.status,
+	    pkt->body.report.acc[ID_AXIS_X],
 	    pkt->body.report.acc[ID_AXIS_Y], pkt->body.report.acc[ID_AXIS_Z],
 	    pkt->body.report.angle, pkt->body.report.vbat, pkt->body.report.temp,
 	    pkt->body.report.csq, pkt->body.report.sats);
@@ -611,6 +678,8 @@ void Solution::report(void)
     util_sc7a20_status_s sensor = util_sc7a20_get_status();
     // AI生成注释: 获取模拟信号状态（电池电压、温度等）
     util_analog_status_s analog = util_analog_get_status();
+	/* 坐标、卫星数和来源取同一快照，避免 GNSS 接收线程更新时字段错配。 */
+	const util_atgm332d_status_t gnss = util_atgm332d_get_status();
 
     // AI生成注释: 清除震动检测标志位，防止重复上报
     util_sc7a20_clear_vibration_flag();
@@ -625,12 +694,12 @@ void Solution::report(void)
     rsps.body.report.acc[ID_AXIS_X] = sensor.x;
     rsps.body.report.acc[ID_AXIS_Y] = sensor.y;
     rsps.body.report.acc[ID_AXIS_Z] = sensor.z;
-    // AI生成注释: 设置设备倾斜角度（转换为16位整数）
-    rsps.body.report.angle = (int16_t) sensor.lean_angle;
+    // 传感器倾角为 0~180°，协议按 1 字节整数上报。
+    rsps.body.report.angle = static_cast<uint8_t>(sensor.lean_angle);
     // AI生成注释: 设置地理位置坐标（经度）
-    rsps.body.report.geo[ID_LONGITUDE] = util_atgm332d_get_status().longitude; //测试地理位置
+    rsps.body.report.geo[ID_LONGITUDE] = gnss.longitude; //测试地理位置
     // AI生成注释: 设置地理位置坐标（纬度）
-    rsps.body.report.geo[ID_LATITUDE] = util_atgm332d_get_status().latitude; //测试地理位置;
+    rsps.body.report.geo[ID_LATITUDE] = gnss.latitude; //测试地理位置;
     // AI生成注释: 生成状态字节，包含工作模式、唤醒源、震动状态、倾斜状态、定位状态等信息
     /* geoStat：本周期 GNSS fix 或本周期 LBS 成功（对齐 Slope fill_for_report） */
     rsps.body.report.status = helper_status_byte_maker(this->rt_solution.mode,
@@ -640,8 +709,8 @@ void Solution::report(void)
     rsps.body.report.temp = (int8_t) analog.temperture;
     // AI生成注释: 设置RTC时间戳
     rsps.body.report.time = (uint32_t) util_lowpower_get_rtc();
-    // AI生成注释: 设置电池电压（转换为0.1V为单位的8位整数）
-    rsps.body.report.vbat = (uint8_t) (analog.vbat * 10.0f);
+    /* 0.1V/LSB，四舍五入；低电判断须用同一量化值 */
+    rsps.body.report.vbat = util_analog_vbat_01v_round();
     /* 功能码1连报时避免每次 AT+CSQ（占 at_mutex，易与 RX/写包叠出 HardFault） */
     {
     static int s_csq_cache = 0;
@@ -656,7 +725,8 @@ void Solution::report(void)
     rsps.body.report.csq = (csq_now < 0) ? 0 : (uint8_t) csq_now;
     }
     // AI生成注释: 设置用于定位的卫星数量（来自GGA的numSv，表示定位质量）
-    rsps.body.report.sats = util_atgm332d_get_status().sats;
+    rsps.body.report.sats = gnss.sats;
+    rsps.body.report.geo_source = static_cast<uint8_t>(gnss.geo_source);
     // AI生成注释: 计算数据包的CRC校验值
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
@@ -906,9 +976,10 @@ void Solution::event_action_message(void)
 			this->message_upload_sys_parameters();
 			break;
 		    // AI生成注释: 服务器请求修改系统配置
-		    case e_pb_func::down_configSystem:
-			this->message_change_sys_parameters(
-				(pb_systemConfig*) param_ptr);
+	    case e_pb_func::down_configSystem:
+		this->message_change_sys_parameters(
+			possible_header->dataLen == sizeof(pb_systemConfig) ?
+				(pb_systemConfig*) param_ptr : nullptr);
 			break;
 		    // AI生成注释: 服务器请求修改工作模式
 		    case e_pb_func::down_configWorkMode:
@@ -917,7 +988,16 @@ void Solution::event_action_message(void)
 			break;
 		    /* 服务器查询固件版本（func=17） */
 		    case e_pb_func::down_uploadFirmwareVersion:
-			this->message_upload_firmware_version();
+			/* 查询命令没有数据域，拒绝带载荷请求以保持帧语义确定。 */
+			if (possible_header->dataLen == 0u)
+			    {
+			    this->message_upload_firmware_version();
+			    }
+			else
+			    {
+			    logWarning("固件版本查询: 数据长度错误 (期望 0，实际 %u)",
+				    (unsigned) possible_header->dataLen);
+			    }
 			break;
 		    case e_pb_func::down_configLocateGeo:
 			this->message_config_locate_geo(
@@ -932,7 +1012,24 @@ void Solution::event_action_message(void)
 		    case e_pb_func::down_uploadLocateSwitch:
 			this->message_upload_locate_switch();
 			break;
-			}
+		    /* 功能码 25：OTA 请求（免配置模式；本机桩拒绝） */
+	    case e_pb_func::down_otaRequest:
+		this->message_ota_request(
+			possible_header->dataLen == sizeof(pb_otaRequest) ?
+				(const pb_otaRequest*) param_ptr : nullptr);
+		break;
+	    /* 雨量计功能未编译：查询/设置均回对应结果码，明确不可用。 */
+	    case e_pb_func::down_uploadRainAdaptiveConfig:
+	    case e_pb_func::down_configRainAdaptiveConfig:
+		this->message_rain_feature_unsupported(
+			e_pb_func::up_rainAdaptiveConfigResult, 0x06u);
+		break;
+	    case e_pb_func::down_uploadRainPowerTiming:
+	    case e_pb_func::down_configRainPowerTiming:
+		this->message_rain_feature_unsupported(
+			e_pb_func::up_rainPowerTimingResult, 0x05u);
+		break;
+		}
 		    // AI生成注释: 消息处理完成，释放内存并返回
 		    vPortFree(message);
 		    return;
@@ -1029,7 +1126,9 @@ void Solution::message_change_run_parameters(pb_runningConfig *params)
 	sensor_config.cool_down_timeout =
 		(uint32_t) params->t5_motionDetect_delay_sec * 1000u;
 	util_sc7a20_set_config(sensor_config);
-	analog_config.low_battery_threshold = params->n1_vbatAlarm_threshold_volt / 10.0f;
+	/* 与上报 vbat 同单位 0.1V，低电见 util_analog_is_low_battery */
+	analog_config.low_battery_threshold =
+		(float) params->n1_vbatAlarm_threshold_volt;
 	util_analog_set_config(analog_config);
 	nvm->save();
 	nvm_commit_host_config();
@@ -1270,7 +1369,8 @@ void Solution::message_upload_sys_parameters(void)
 
 /**
  * @brief 应答服务器固件版本查询（down_uploadFirmwareVersion=17）
- * @note  上行功能码 16，数据域 year/month/revision 来自 PRODUCT_CONFIG
+ * @note  上行功能码 16，数据域 year/month/revision 来自 PRODUCT_CONFIG；
+ *        单槽固件由 PROD_CFG_FIRMWARE_ACTIVE_SLOT 固定上报 A 区（0）。
  */
 void Solution::message_upload_firmware_version(void)
     {
@@ -1282,14 +1382,16 @@ void Solution::message_upload_firmware_version(void)
     rsps.body.firmwareVersion.year = PROD_FW_VER_YEAR;
     rsps.body.firmwareVersion.month = PROD_FW_VER_MONTH;
     rsps.body.firmwareVersion.revision = PROD_FW_VER_REVISION;
+    rsps.body.firmwareVersion.active_slot = PROD_CFG_FIRMWARE_ACTIVE_SLOT;
 
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
 
     send_message((uint8_t*) &rsps, sizeof(pb_packFirmwareVersion));
-    logInfo("固件版本应答: %02u.%02u.%02u",
+    logInfo("固件版本应答: %02u.%02u.%02u, 活动槽位=%c",
 	    (unsigned) PROD_FW_VER_YEAR, (unsigned) PROD_FW_VER_MONTH,
-	    (unsigned) PROD_FW_VER_REVISION);
+	    (unsigned) PROD_FW_VER_REVISION,
+	    PROD_CFG_FIRMWARE_ACTIVE_SLOT == 0u ? 'A' : 'B');
     }
 
 /** 应答写入定位信息：配置模式下写入 GNSS 缓存并落 NVM */
@@ -1376,6 +1478,57 @@ void Solution::message_upload_locate_switch(void)
     send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
     logInfo("定位开关上传: 0x%02X",
 	    (unsigned) rsps.body.cmdletOrResponse);
+    }
+
+/**
+ * 功能码 25：OTA 请求应答 24（桩实现）
+ * L432 无双 Bank/升级分区时固定拒绝，避免上位机超时；不启动 YModem/Boot
+ */
+void Solution::message_ota_request(const pb_otaRequest *req)
+    {
+    pb_packOtaAck rsps;
+    uint8_t result;
+    /* 低电按上报同量化值判断；本机无 OTA 能力时仍拒绝 */
+    if (req == nullptr)
+	{
+	result = static_cast<uint8_t>(OTA_ACK_BAD_PARAM);
+	}
+    else if (util_analog_is_low_battery())
+	{
+	result = static_cast<uint8_t>(OTA_ACK_LOW_BATTERY);
+	}
+    else
+	{
+	result = static_cast<uint8_t>(OTA_ACK_REJECT);
+	}
+    (void) req;
+
+    rsps.body.otaAck.result = result;
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_otaAck;
+    rsps.body.header.dataLen = sizeof(pb_otaAck);
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    clear_report_pending_ack();
+    send_message((uint8_t*) &rsps, sizeof(pb_packOtaAck));
+    logInfo("OTA Ack=%u (stub, capable=%d)", (unsigned) result,
+	    (int) PROD_CFG_OTA_CAPABLE);
+    }
+
+/** 对未编译的雨量功能返回协议 v2.2 为该组定义的“功能不可用”结果。 */
+void Solution::message_rain_feature_unsupported(e_pb_func response_func,
+	uint8_t unavailable_result)
+    {
+    pb_packCmdletOrResponse rsps;
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = response_func;
+    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.cmdletOrResponse = unavailable_result;
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    logInfo("雨量功能: func=%u 不支持, response=%u",
+	(unsigned) response_func, (unsigned) unavailable_result);
     }
 
 /* LBS 会话状态（对齐 Slope sys_gnss：事件循环执行，不堵在 start_locate） */
@@ -1586,39 +1739,100 @@ void Solution::start_lbs_if_needed(void)
  */
 void Solution::message_change_sys_parameters(pb_systemConfig *params)
     {
-    // AI生成注释: 创建命令响应数据包
     pb_packCmdletOrResponse rsps;
-
-    // AI生成注释: 设置响应数据包头部信息
+    bool success = false;
     rsps.body.header.code = this->rt_solution.systemConfig.code;
     rsps.body.header.function = e_pb_func::up_systemConfigResult;
     rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
 
-    if (this->config_write_allowed(e_pb_func::down_configSystem))
+	if (!this->config_write_allowed(e_pb_func::down_configSystem)
+		|| params == nullptr
+		|| !endpoint_switch_endpoint_valid(params->runServerIP,
+			params->runServerPort)
+		|| !endpoint_switch_endpoint_valid(params->backupServerIP,
+			params->backupServerPort))
 	{
-	// AI生成注释: 配置编辑模式下，应用系统配置
-	this->rt_solution.systemConfig = *params;
-	air->setServer(params->runServerIP, params->runServerPort,
-		AIR780EP::air780_server_t::server_main);
-	air->setServer(params->backupServerIP, params->backupServerPort,
-		AIR780EP::air780_server_t::server_aux);
-	util_sc7a20_config_s sensor_config = util_sc7a20_get_config();
-	sensor_config.range = this->rt_solution.systemConfig.sensorReverseRange;
-	sensor_config.acc_thres16mg_lsb = params->sensorVibrationThreshold;
-	util_sc7a20_set_config(sensor_config);
-	nvm->save();
-	nvm_commit_host_config();
-	rsps.body.cmdletOrResponse = 0; /* 0: 全部设定成功 */
+	logWarning("系统配置: 未授权、长度或端点参数无效");
 	}
     else
 	{
-	rsps.body.cmdletOrResponse = 255; /* 255: 全部设定失败 */
+	pb_systemConfig old_system = this->rt_solution.systemConfig;
+	const util_sc7a20_config_s old_sensor = util_sc7a20_get_config();
+	const bool active_main = this->rt_solution.connect_to_main_server;
+	const auto active_server = active_main ? AIR780EP::server_main :
+		AIR780EP::server_aux;
+	const auto other_server = active_main ? AIR780EP::server_aux :
+		AIR780EP::server_main;
+	const bool same_endpoints =
+		memcmp(params->runServerIP, params->backupServerIP, 4u) == 0
+		&& params->runServerPort == params->backupServerPort;
+	bool server_timer_was_active = false;
+	bool device_timer_was_active = false;
+
+	/* 新端点验证和 Flash 提交期间不允许 Timer 任务抢占 AT 链路。 */
+	endpoint_switch_in_progress_ = true;
+	endpoint_switch_pause_timers(&server_timer_was_active,
+		&device_timer_was_active);
+	air->disconnect(AIR780EP::server_main);
+	air->disconnect(AIR780EP::server_aux);
+	air->setServer(params->runServerIP, params->runServerPort,
+		AIR780EP::server_main);
+	air->setServer(params->backupServerIP, params->backupServerPort,
+		AIR780EP::server_aux);
+
+	bool connected = true;
+	if (!same_endpoints)
+	    {
+	    connected = endpoint_switch_connect(other_server,
+		PROD_CFG_ENDPOINT_SWITCH_CONNECT_ATTEMPTS);
+	    if (connected)
+		{
+		air->disconnect(other_server);
+		}
+	    }
+	if (connected)
+	    {
+	    connected = endpoint_switch_connect(active_server,
+		PROD_CFG_ENDPOINT_SWITCH_CONNECT_ATTEMPTS);
+	    }
+
+	if (connected)
+	    {
+	    this->rt_solution.systemConfig = *params;
+	    util_sc7a20_config_s new_sensor = old_sensor;
+	    new_sensor.range = params->sensorReverseRange;
+	    new_sensor.acc_thres16mg_lsb = params->sensorVibrationThreshold;
+	    util_sc7a20_set_config(new_sensor);
+	    nvm->save();
+	    success = nvm_commit_host_config();
+	    }
+
+	if (!success)
+	    {
+	    /* 验证或提交失败都恢复 RAM、页缓冲和 LTE 端点，再尝试回原活动链路。 */
+	    air->disconnect(AIR780EP::server_main);
+	    air->disconnect(AIR780EP::server_aux);
+	    this->rt_solution.systemConfig = old_system;
+	    util_sc7a20_set_config(old_sensor);
+	    air->setServer(old_system.runServerIP, old_system.runServerPort,
+		AIR780EP::server_main);
+	    air->setServer(old_system.backupServerIP, old_system.backupServerPort,
+		AIR780EP::server_aux);
+	    nvm->save();
+	    const bool rollback_flash_ok = nvm_commit_host_config();
+	    const bool rollback_connected = endpoint_switch_connect(active_server,
+		PROD_CFG_ENDPOINT_SWITCH_ROLLBACK_ATTEMPTS);
+	    logWarning("系统配置: 回退 Flash=%d 链路=%d", (int) rollback_flash_ok,
+		(int) rollback_connected);
+	    }
+
+	endpoint_switch_resume_timers(server_timer_was_active,
+		device_timer_was_active);
+	endpoint_switch_in_progress_ = false;
 	}
-    // AI生成注释: 计算响应数据包的CRC校验值
+	rsps.body.cmdletOrResponse = success ? 0x00u : 0xFFu;
     rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
 	    CFL(rsps.body));
-//    util_air780_net_write((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
-    // AI生成注释: 发送系统配置结果响应到服务器
     send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
     }
 
@@ -1803,9 +2017,10 @@ int Solution::read_message(void *dest, uint16_t len)
  */
 void Solution::server_timeout_timer_callback(TimerHandle_t xTimer)
     {
-    (void) xTimer;
+    auto *pthis = (Solution*) pvTimerGetTimerID(xTimer);
     /* 只投递事件：report 含 AT/日志，放 Timer 任务会栈溢出且堵住喂狗定时器 */
-    if (util_agnss_rx_is_active())
+    if (util_agnss_rx_is_active()
+	    || (pthis != nullptr && pthis->endpoint_switch_in_progress_))
 	{
 	return;
 	}
@@ -1818,7 +2033,8 @@ void Solution::server_timeout_timer_callback(TimerHandle_t xTimer)
 void Solution::device_timeout_timer_callback(TimerHandle_t xTimer)
     {
     auto *pthis = (Solution*) pvTimerGetTimerID(xTimer);
-    if (util_agnss_rx_is_active())
+    if (util_agnss_rx_is_active()
+	    || (pthis != nullptr && pthis->endpoint_switch_in_progress_))
 	{
 	/* 单次定时器：AGNSS 中错过则再开一轮，避免永远不睡 */
 	xTimerStart(xTimer, 0);
@@ -1831,7 +2047,7 @@ void Solution::device_timeout_timer_callback(TimerHandle_t xTimer)
 /** 工作线程执行：服务器超时上报 */
 void Solution::event_action_server_report(void)
     {
-    if (util_agnss_rx_is_active())
+    if (util_agnss_rx_is_active() || endpoint_switch_in_progress_)
 	{
 	return;
 	}
@@ -1841,7 +2057,7 @@ void Solution::event_action_server_report(void)
 /** 工作线程执行：在线超时进休眠 */
 void Solution::event_action_device_sleep(void)
     {
-    if (util_agnss_rx_is_active())
+    if (util_agnss_rx_is_active() || endpoint_switch_in_progress_)
 	{
 	return;
 	}

@@ -40,7 +40,8 @@ using namespace magic_enum;
 #define NVM_PARTITION_PAGE_ADDRESS(x)			NVM_START_ADDRESS+NVM_PAGE_SIZE*(x/4)
 #define NVM_PARTITION_PAGE_OFFSET(x)			((x)*NVM_PARTITION_SIZE)
 
-void __flash_sync(void);
+/** 将页缓冲刷入 Flash；擦除或编程失败时返回 false。 */
+bool __flash_sync(void);
 
 class NVM: public osAllocator<NVM>
     {

@@ -62,9 +62,12 @@
 #define GNSS_FILTER_DMAX_M         10.0f    //偏差剔除阈值(米)
 #define GNSS_FILTER_MIN_SATS       4        //参与滤波的最低卫星数
 
-// static const util_atgm332d_status_t default_status = { 116.397477f, 39.908692f,
-static const util_atgm332d_status_t default_status = { 0.10, 10.0,
-		1739245514, false, 0, 0u };
+/** NVM 格式变更时清空旧坐标，避免旧结构的填充字节被解释为 geo_source。 */
+static constexpr uint32_t kAtgm332dNvmFormatMagic = 0x474E5353u; /* "GNSS" */
+
+static const util_atgm332d_status_t default_status = {
+		kAtgm332dNvmFormatMagic, 0.0f, 0.0f, 0, false, 0,
+		util_geo_source_none, 0u };
 
 static util_atgm332d_status_t status;
 
@@ -99,7 +102,7 @@ static void bd_deact_timer_callback(TimerHandle_t xtimer) {
 
 /**
  * 坐标写入 NVM 页缓冲（RAM），不擦写 Flash。
- * 落盘时不把 position_fixed/sats 写入 Flash（对齐 Slope gnss_nvm_persist_to_buffer）。
+ * 落盘时不把 position_fixed/sats 写入 Flash；坐标与 geo_source 始终作为同一记录写入。
  */
 static void atgm332d_nvm_persist_to_buffer(void) {
 	if (nvm_atgm332d == nullptr) {
@@ -236,6 +239,7 @@ static void atgm332d_rx_thread(void *argument) {
 		if (accepted) {
 			status.time = rmc->unixTime;
 			status.position_fixed = true;
+			status.geo_source = util_geo_source_gnss;
 			/* Slope：只写页缓冲 / 标 dirty，绝不在 RX 里 Erase/Program Flash */
 			atgm332d_nvm_on_geo_updated();
 			/* 不用 %f：newlib 浮点格式化栈大，RX 任务易溢出；单位=1e-4度 */
@@ -295,6 +299,12 @@ void util_atgm332d_load(void) {
 	if (nvm_atgm332d->isFactoryDefault()) {
 		nvm_atgm332d->restoreDefault();
 		nvm_atgm332d->save();
+	} else if (status.nvm_format_magic != kAtgm332dNvmFormatMagic) {
+		/* 旧记录没有 geo_source，清空后写入新格式，等待下一次有效定位。 */
+		nvm_atgm332d->restoreDefault();
+		nvm_atgm332d->save();
+		__flash_sync();
+		logInfo("北斗: 旧NVM记录已清空，等待新定位");
 	}
 	status.position_fixed = false;
 	lbs_ok_this_wake_ = false;
@@ -420,6 +430,7 @@ bool util_atgm332d_set_manual_geo(float lon, float lat) {
 	status.longitude = lon;
 	status.latitude = lat;
 	status.sats = 0;
+	status.geo_source = util_geo_source_server;
 	/* 与 Slope 一致：写入后不标为 GNSS 新定位，坐标仍会被 report 读出 */
 	status.position_fixed = false;
 	status.time = util_lowpower_get_rtc();
@@ -461,6 +472,7 @@ bool util_atgm332d_apply_lbs_geo(float lon, float lat) {
 	status.longitude = lon;
 	status.latitude = lat;
 	status.sats = 0;
+	status.geo_source = util_geo_source_lbs;
 	status.time = util_lowpower_get_rtc();
 	lbs_ok_this_wake_ = true;
 	nvm_dirty_ = true;

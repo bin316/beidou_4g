@@ -126,7 +126,7 @@ private:
     void message_upload_sys_parameters(void);
     void message_change_sys_parameters(pb_systemConfig *params);
     void message_change_execute_mode(solution_mode_e *mode);
-    /** 服务器请求固件版本（func=17）时上行 year/month/revision */
+    /** 下行 17 的零长度查询：上行 16 回 year/month/revision/active_slot。 */
     void message_upload_firmware_version(void);
     /** 下行19：写经纬度到 GNSS 缓存并落 NVM */
     void message_config_locate_geo(pb_locateGeo *geo);
@@ -134,6 +134,14 @@ private:
     void message_config_locate_switch(uint8_t *value);
     /** 下行23：查询 locateSwitch */
     void message_upload_locate_switch(void);
+    /**
+     * 下行25：OTA 请求；本机无升级能力时桩应答上行24
+     * dataLen 非法→result=5；否则→result=0（拒绝）
+     */
+    void message_ota_request(const pb_otaRequest *req);
+    /** 雨量功能未编译时，用 v2.2 对应结果码明确返回“不支持”。 */
+    void message_rain_feature_unsupported(e_pb_func response_func,
+	uint8_t unavailable_result);
     /** 服务器 OK：仅 awaiting_report_ok_ 时可能休眠（对齐 Inclination） */
     void message_heartbeat(void);
     void mark_report_pending_ack(void);
@@ -148,6 +156,17 @@ private:
     bool config_write_allowed(uint8_t write_func) const;
     /** 进 Standby 前清除配置会话，避免跨睡残留 editing 而无 intent */
     void clear_config_session_for_standby(void);
+
+    /** 功能码 13 验证新端点期间阻止定时器投递 report/休眠事件。 */
+    bool endpoint_switch_in_progress_ = false;
+    bool endpoint_switch_endpoint_valid(const uint8_t ip[4],
+	uint16_t port) const;
+    bool endpoint_switch_connect(AIR780EP::air780_server_t server,
+	uint8_t attempts);
+    void endpoint_switch_pause_timers(bool *server_was_active,
+	bool *device_was_active);
+    void endpoint_switch_resume_timers(bool server_was_active,
+	bool device_was_active);
 
 //	服务器响应超时定时器相关变量
     TimerHandle_t server_timeout_timer;

@@ -31,7 +31,7 @@ static const size_t flash_PartitionTotal = 8;
 static const size_t flash_PageSize = 2048;
 static const size_t flash_PageNum = 127;
 
- void __flash_sync(void);
+ bool __flash_sync(void);
 static void __flash_init(void);
 static void __flash_read(void);
 static void __flash_buffer_read(void *data, uint16_t offset, uint16_t size);
@@ -78,7 +78,7 @@ __STATIC_INLINE void __flash_init(void)
  * 	1. erase the flash page
  * 	2. write the page buffer to the flash page
  */
-void __flash_sync(void)
+bool __flash_sync(void)
     {
     FLASH_EraseInitTypeDef erase;
     uint32_t page_error = 0;
@@ -99,23 +99,35 @@ void __flash_sync(void)
 	{
 	HAL_FLASH_Lock();
 	xSemaphoreGive(flash_Sem);
-	return;
+	return false;
 	}
     // Program the flash memory with the new data
     for (int i = 0; i < 256; i++)
 	{
-	HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+	if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
 		(flash_BaseAddress) + i * 8,
-		*((uint64_t*) &flash_pagebuffer[i * 8]));
+		*((uint64_t*) &flash_pagebuffer[i * 8])) != HAL_OK)
+	    {
+	    HAL_FLASH_Lock();
+	    xSemaphoreGive(flash_Sem);
+	    return false;
+	    }
 	/* 擦写期间取指停顿，定时喂狗防 IWDG（约 4s） */
 	if ((i & 0x1F) == 0)
 	    {
 	    HAL_IWDG_Refresh(&hiwdg);
 	    }
 	}
+    if (memcmp((const void*) flash_BaseAddress, flash_pagebuffer,
+	flash_PageSize) != 0)
+	{
+	HAL_FLASH_Lock();
+	xSemaphoreGive(flash_Sem);
+	return false;
+	}
     HAL_FLASH_Lock();
-    xSemaphoreGive(flash_Sem);
-    return;
+	xSemaphoreGive(flash_Sem);
+	return true;
     }
 
 /*

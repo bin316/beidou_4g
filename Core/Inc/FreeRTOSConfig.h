@@ -70,8 +70,15 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 在保留 newlib 4.5K 前提下尽量加大 RTOS 堆；30464 留出链接余量（曾 overflow 88B） */
-#define configTOTAL_HEAP_SIZE                    ((size_t)30464)
+/*
+ * RTOS 堆总量不变；其中 4KB 放在 SRAM2（heap_5），缓解 RAM1 近满。
+ * 区域定义见 Core/Src/freertos_heap_regions.c
+ */
+#define configHEAP_RAM2_SIZE                     ((size_t)4096)
+#define configHEAP_RAM1_SIZE                     ((size_t)(30464 - 4096))
+#define configTOTAL_HEAP_SIZE                    (configHEAP_RAM1_SIZE + configHEAP_RAM2_SIZE)
+/* 应用自行提供堆区域并调用 vPortDefineHeapRegions（配合 heap_5） */
+#define configAPPLICATION_ALLOCATED_HEAP         1
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -131,7 +138,7 @@ to exclude the API function. */
  * The CMSIS-RTOS V2 FreeRTOS wrapper is dependent on the heap implementation used
  * by the application thus the correct define need to be enabled below
  */
-#define USE_FreeRTOS_HEAP_4
+#define USE_FreeRTOS_HEAP_5
 
 /* Cortex-M specific definitions. */
 #ifdef __NVIC_PRIO_BITS

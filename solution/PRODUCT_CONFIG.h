@@ -100,4 +100,19 @@
 /** LBS 与 NVM 历史点距离≤该值(米)时保留 NVM、geoStat=0；更大则写入 LBS */
 #define PROD_CFG_LBS_NVM_KEEP_MAX_M                                 (1000.f)
 
+/** 功能码 13 地址切换：每端点 3×2s，失败间隔 500ms；主备完整验证约 14s。 */
+#define PROD_CFG_ENDPOINT_SWITCH_CONNECT_ATTEMPTS                    (3u)
+#define PROD_CFG_ENDPOINT_SWITCH_RETRY_INTERVAL_MS                   (500u)
+#define PROD_CFG_ENDPOINT_SWITCH_ROLLBACK_ATTEMPTS                   (3u)
+#define PROD_CFG_ENDPOINT_SWITCH_ATTEMPT_TIMEOUT_MS                  (2000u)
+
+/** 单槽固件按协议 v2.2 报告为 slot A；本机 OTA 请求仍会拒绝。 */
+#define PROD_CFG_FIRMWARE_ACTIVE_SLOT                                (0u)
+
+/**
+ * OTA 能力：0=L432 无双 Bank/升级分区，功能码 25 固定桩应答拒绝
+ * （协议仍解析并回 24，便于上位机兼容）
+ */
+#define PROD_CFG_OTA_CAPABLE                                        (0)
+
 #endif /* PRODUCT_CONFIG_H_ */

@@ -7,7 +7,7 @@
  * ------------------------------------------------------------------------------
  * 卫星数量 sats 字段说明
  * ------------------------------------------------------------------------------
- * pb_report 中添加第25字节 sats 字段表示用于定位的卫星数量，来源于 GGA 语句的 numSv，
+ * pb_report 中的 sats 字段表示用于定位的卫星数量，来源于 GGA 语句的 numSv，
  * 范围 0~24，0 表示未定位或无效，用于上报数据包中体现定位质量。
  *
  * ------------------------------------------------------------------------------
@@ -48,6 +48,11 @@ typedef enum : uint8_t
     up_locateGeoResult = 18,
     up_locateSwitchResult = 20,
     up_locateSwitchUpload = 22,
+    up_otaAck = 24,                /* OTA 请求应答 result */
+    up_rainAdaptiveConfigUpload = 26,
+    up_rainAdaptiveConfigResult = 28,
+    up_rainPowerTimingUpload = 30,
+    up_rainPowerTimingResult = 32,
 
     down_uploadReport = 1,
     down_uploadRunningConfig = 3,
@@ -61,9 +66,26 @@ typedef enum : uint8_t
     down_configLocateGeo = 19,
     down_configLocateSwitch = 21,
     down_uploadLocateSwitch = 23,
+    down_otaRequest = 25,          /* OTA 升级请求 */
+    down_uploadRainAdaptiveConfig = 27,
+    down_configRainAdaptiveConfig = 29,
+    down_uploadRainPowerTiming = 31,
+    down_configRainPowerTiming = 33,
 
     preserved
     } e_pb_func;
+
+/** up_otaAck.result（与协议 v2.2 / Inclination 对齐） */
+typedef enum : uint8_t
+    {
+    OTA_ACK_REJECT = 0,            /* 拒绝（本机无双 Bank/空间不足等） */
+    OTA_ACK_ACCEPT = 1,            /* 接受 */
+    OTA_ACK_BUSY = 2,              /* 忙（已有会话） */
+    OTA_ACK_LOW_BATTERY = 3,       /* 电量不足 */
+    OTA_ACK_VERSION_NOT_NEWER = 4, /* 目标版本不新于当前 */
+    OTA_ACK_BAD_PARAM = 5,         /* 参数非法 */
+    OTA_ACK_TOO_LARGE = 6,         /* 镜像过大 */
+    } e_ota_ack_result;
 
 typedef enum : uint8_t
     {
@@ -126,11 +148,12 @@ typedef struct
     float geo[2]; 		//地理信息，0经度，1纬度
     uint8_t status; 	//工作模式(2)+唤醒源(2)+震动状态(1)+保留位(1)+倾斜状态(1)+定位状态(1)，对应bit7~0
     int16_t acc[3]; 	//x、y、z三周加速度，单位mg
-    int16_t angle; 	    //倾角
-    uint8_t vbat; 		//电池电压
+    uint8_t angle; 	    //倾角，单位°，范围0~180
+    uint8_t vbat; 		//电池电压，单位[0.1V]，上报四舍五入
     int8_t temp; 		//主机温度
     uint8_t csq;        //4G模块信号强度
     uint8_t sats;       //用于定位的卫星数量
+    uint8_t geo_source; //0=无坐标，1=GNSS，2=4G/LBS，3=上位机下发
     } pb_report; 		//sizeof(report) = 25
 
 typedef struct
@@ -240,12 +263,13 @@ typedef struct SystemConfig
 	}
     } pb_systemConfig;
 
-/** 固件版本：年(后两位)/月/当月修订号，均为二进制整数 */
+/** 固件版本：年(后两位)/月/当月修订号/活动槽位，均为二进制整数 */
 typedef struct
     {
     uint8_t year;
     uint8_t month;
     uint8_t revision;
+    uint8_t active_slot; /* 0=A，1=B；单槽产品固定报 0 */
     } pb_firmwareVersion;
 
 /** 下行 19：写入经纬度 */
@@ -253,6 +277,31 @@ typedef struct
     {
     float geo[2]; // [0]经度 [1]纬度
     } pb_locateGeo;
+
+/**
+ * 功能码 25：OTA 请求（dataLen = 12）
+ * L432 本工程不支持真 OTA，仅解析后桩应答 24
+ */
+typedef struct
+    {
+    uint8_t ver_year;
+    uint8_t ver_month;
+    uint8_t ver_revision;
+    uint8_t target_slot;
+    uint32_t image_size;
+    uint32_t image_crc32;
+    } pb_otaRequest;
+
+static_assert(sizeof(pb_firmwareVersion) == 4,
+	"pb_firmwareVersion must be 4 bytes");
+static_assert(sizeof(pb_otaRequest) == 12,
+	"pb_otaRequest must be 12 bytes");
+
+/** 功能码 24：OTA 接受/拒绝 */
+typedef struct
+    {
+    uint8_t result; /* e_ota_ack_result */
+    } pb_otaAck;
 
 typedef struct
     {
@@ -267,6 +316,10 @@ typedef struct
 	uint16_t crc; //sizeof(crc) = 2
 	} body;
     } pb_packReport;
+
+static_assert(sizeof(pb_report) == 25, "pb_report must be 25 bytes");
+static_assert(sizeof(pb_packReport) == 36,
+	"pb_packReport must be 36 bytes");
 
 typedef struct
     {
@@ -352,7 +405,7 @@ typedef struct
 	} body;
     } pb_packCmdletOrResponseSimple;
 
-/** 上行固件版本回复包：FA×3 + header + year/month/revision + CRC */
+/** 上行固件版本回复包：FA×3 + header + year/month/revision/active_slot + CRC */
 typedef struct
     {
     const uint8_t prefix[3] =
@@ -366,6 +419,21 @@ typedef struct
 	uint16_t crc;
 	} body;
     } pb_packFirmwareVersion;
+
+/** 上行 OTA 应答包：FA×3 + header + result(1B) + CRC */
+typedef struct
+    {
+    const uint8_t prefix[3] =
+	{
+	0xFA, 0xFA, 0xFA
+	};
+    struct
+	{
+	pb_header header;
+	pb_otaAck otaAck;
+	uint16_t crc;
+	} body;
+    } pb_packOtaAck;
 
 #pragma pack(pop)
 

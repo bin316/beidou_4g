@@ -26,10 +26,12 @@
 #include "timers.h"
 
 #include "utilties.h"
+#include "PRODUCT_CONFIG.h"
 
 #include "NVM.h"
 
 #include "arm_math.h"
+#include "math.h"
 
 // Filter configuration macros
 #define ANALOG_FILTER_SIZE            256      // Size of the filter buffer (must be power of 2 for efficiency)
@@ -50,7 +52,8 @@ analog_handle factory =
 		. analog_performance = perf_balanced,
 		. vbat_take_from_dedicated_pin = true,
 		. alert_on_battery = thres_low,
-		. low_battery_threshold = 2.0f,
+		/* 与协议 n1 同单位 0.1V（旧 NVM 若存伏特会在 init 时迁移） */
+		. low_battery_threshold = (float) PROD_CONFIG_FACTORY_VBAT_LOW,
 		. high_battery_threshold = 3.4f,
 		. alert_on_temperature = thres_high,
 		. high_temperture_threshold = 80.0f,
@@ -285,6 +288,30 @@ void __util_analog_init__(void)
 	logInfo("NVM: 已恢复出厂默认");
 	}
 
+    /* 旧固件把阈值存成伏特(约1~6)；现与上报同为 0.1V(约10~60) */
+    {
+    float thr = analog_rt.config.low_battery_threshold;
+    bool changed = false;
+    if (thr > 0.0f && thr <= 6.0f)
+	{
+	thr *= 10.0f;
+	changed = true;
+	logInfo("低电阈值已从伏特迁移为0.1V: %.0f", (double) thr);
+	}
+    else if (thr < 10.0f || thr > 60.0f)
+	{
+	thr = (float) PROD_CONFIG_FACTORY_VBAT_LOW;
+	changed = true;
+	logInfo("低电阈值非法，回退出厂 %u (0.1V)",
+		(unsigned) PROD_CONFIG_FACTORY_VBAT_LOW);
+	}
+    if (changed)
+	{
+	analog_rt.config.low_battery_threshold = thr;
+	analog_nvm->save();
+	}
+    }
+
     HAL_ADC_RegisterCallback(&hadc1, HAL_ADC_CONVERSION_COMPLETE_CB_ID,
 	    util_analog_timer_callback);
 
@@ -303,6 +330,38 @@ util_analog_status_s util_analog_get_status(void)
     {
     // Implementation for getting the current status
     return analog_rt.status;
+    }
+
+/** 伏特 → 0.1V，四舍五入（与协议上报 vbat 一致） */
+uint8_t util_analog_vbat_01v_round(void)
+    {
+    float v = analog_rt.status.vbat;
+    if (v < 0.0f)
+	{
+	v = 0.0f;
+	}
+    long r = lroundf(v * 10.0f);
+    if (r < 0)
+	{
+	r = 0;
+	}
+    if (r > 255)
+	{
+	r = 255;
+	}
+    return (uint8_t) r;
+    }
+
+/** 用与上报相同的量化值做低电判断，避免浮点截断与上报不一致 */
+bool util_analog_is_low_battery(void)
+    {
+    const uint8_t vbat_01 = util_analog_vbat_01v_round();
+    long thr = lroundf(analog_rt.config.low_battery_threshold);
+    if (thr < 10 || thr > 60)
+	{
+	thr = PROD_CONFIG_FACTORY_VBAT_LOW;
+	}
+    return vbat_01 < (uint8_t) thr;
     }
 
 /**

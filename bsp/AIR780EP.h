@@ -67,7 +67,12 @@ public:
 	/**
 	 * @brief 连接 TCP；timeout_ms>0 且 server_debug 时走 AGNSS 短连（对齐 Slope）
 	 */
-	bool connect(air780_server_t server = server_main, uint32_t timeout_ms = 0);
+	/**
+	 * @brief 连接 TCP；普通链路可指定每次等待、尝试次数和退避间隔。
+	 * @note server_debug 保留 timeout_ms 作为 AGNSS 单次短连总超时的既有语义。
+	 */
+	bool connect(air780_server_t server = server_main, uint32_t timeout_ms = 0,
+		uint8_t attempts = 3u, uint32_t retry_interval_ms = 0u);
 	bool disconnect(air780_server_t server = server_main);
 
 	/*

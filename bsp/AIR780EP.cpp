@@ -147,7 +147,8 @@ AIR780EP::~AIR780EP()
 //    	不过好像也不需要析构
     }
 
-bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms)
+bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
+	uint8_t attempts, uint32_t retry_interval_ms)
     {
     xSemaphoreTake(at_mutex_, portMAX_DELAY);
     configASSERT(enum_contains<air780_server_t>(server));
@@ -197,8 +198,10 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms)
 	}
     else
 	{
-	uint8_t try_times = 3;
-	while (try_times--)
+	const uint8_t try_times = (attempts == 0u) ? 1u : attempts;
+	const uint32_t attempt_timeout_ms =
+		(timeout_ms == 0u) ? 2000u : timeout_ms;
+	for (uint8_t try_index = 0; try_index < try_times; ++try_index)
 	    {
 	    sendCmd(100, rx_content_t::CIPSTART,
 		    "AT+CIPSTART=%d,\"TCP\",\"%d.%d.%d.%d\",%d\r\n",
@@ -211,9 +214,20 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms)
 	    if (testif([this, server]()
 		{
 		return connectionsStatus[enum_integer<air780_server_t>(server)];
-		}, true, 2000))
+		}, true, attempt_timeout_ms))
 		{
 		break;
+		}
+	    /* 下一次 CIPSTART 前清理模组链路状态，避免沿用半开连接。 */
+	    sendCmd(100, rx_content_t::CIPCLOSE, "AT+CIPCLOSE=%d\r\n",
+		    enum_integer<air780_server_t>(server));
+	    sendCmd(100, rx_content_t::CIPSTATUS, "AT+CIPSTATUS\r\n");
+	    connectionsStatus[enum_integer<air780_server_t>(server)] = false;
+	    util_lowpower_iwdg_feed();
+	    if (try_index + 1u < try_times && retry_interval_ms > 0u)
+		{
+		vTaskDelay(pdMS_TO_TICKS(retry_interval_ms));
+		util_lowpower_iwdg_feed();
 		}
 	    }
 	ok = connectionsStatus[enum_integer<air780_server_t>(server)];

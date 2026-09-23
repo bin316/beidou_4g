@@ -59,7 +59,7 @@ int INT1_PIN_STATE = 0;
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-
+void freertos_heap_regions_init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -111,6 +111,8 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Init scheduler */
+  /* heap_5：先登记 SRAM2+SRAM1 堆区，再创建任何 RTOS 对象 */
+  freertos_heap_regions_init();
   osKernelInitialize();
 
   /* Call init function for freertos objects (in cmsis_os2.c) */

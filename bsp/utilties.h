@@ -384,7 +384,8 @@ typedef struct {
 	util_common_performance_e analog_performance; /**< Performance level */
 	bool vbat_take_from_dedicated_pin; /**< Take battery voltage from dedicated pin */
 	util_common_threshold_e alert_on_battery; /**< Alert on low battery */
-	float low_battery_threshold; /**< Low battery threshold */
+	/** 低电阈值，单位 0.1V（与协议 n1 / 上报 vbat 一致，如 30=3.0V） */
+	float low_battery_threshold;
 	float high_battery_threshold; /**< High battery threshold */
 	util_common_threshold_e alert_on_temperature; /**< Alert on high temperature */
 	float high_temperture_threshold; /**< Temperature threshold */
@@ -402,6 +403,11 @@ void __util_analog_init__(void);
  * @return util_analog_status_s Current status of the analog utilities.
  */
 util_analog_status_s util_analog_get_status(void);
+
+/** 当前电压四舍五入为协议单位 0.1V（与上报 vbat 同一算法） */
+uint8_t util_analog_vbat_01v_round(void);
+/** 低电：round(vbat) < 阈值(0.1V)，与上报值一致 */
+bool util_analog_is_low_battery(void);
 
 /**
  * @brief Set the configuration for the analog utilities.
@@ -428,12 +434,25 @@ void __util_shell_init__(void);
 /** 通过 SEGGER RTT 输出调试日志（不占 UART2，可与北斗同时使用） */
 void __util_rtt_log_init__(void);
 
+/** 功能码 0 geo_source，同时随坐标写入北斗 NVM。 */
+typedef enum : uint8_t {
+	util_geo_source_none = 0,
+	util_geo_source_gnss = 1,
+	util_geo_source_lbs = 2,
+	util_geo_source_server = 3,
+} util_geo_source_e;
+static_assert(sizeof(util_geo_source_e) == 1,
+	"geo source must occupy one byte");
+
 typedef struct {
+	/** 记录格式版本；不匹配时拒绝旧记录，避免读取旧填充字节。 */
+	uint32_t nvm_format_magic;
 	float longitude;
 	float latitude;
 	time_t time;
 	int position_fixed;
 	uint8_t sats; //用于定位的卫星数量，0~24，来自GGA的numSv
+	util_geo_source_e geo_source;
 	/** 上次实际发出 CIPGSMLOC 的 RTC 秒（合宙 4h 限频，对齐 Slope） */
 	uint32_t lbs_last_query_unix;
 } util_atgm332d_status_t;
@@ -474,4 +493,3 @@ bool util_atgm332d_casbin_stream_write(const uint8_t *data, size_t len,
 util_atgm332d_status_t util_atgm332d_get_status(void);
 
 #endif /* UTILTIES_H_ */
-

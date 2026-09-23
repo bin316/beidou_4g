@@ -186,10 +186,12 @@ SECTIONS
     . = ALIGN(8);
   } >RAM
   
+  /* NVM 页缓冲 / AGNSS 收包 / FreeRTOS 堆片（heap_5）等放 SRAM2 */
   ._ram2_area (NOLOAD) :
   {
-  	. = ALIGN(4);
+  	. = ALIGN(8);
     * (._ram2_area)
+    . = ALIGN(8);
   } >RAM2
 
   /* Remove information from the compiler libraries */
