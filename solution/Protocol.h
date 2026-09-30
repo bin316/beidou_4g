@@ -53,6 +53,7 @@ typedef enum : uint8_t
     up_rainAdaptiveConfigResult = 28,
     up_rainPowerTimingUpload = 30,
     up_rainPowerTimingResult = 32,
+    up_keepOnlineThisWake = 34,
 
     down_uploadReport = 1,
     down_uploadRunningConfig = 3,
@@ -71,6 +72,7 @@ typedef enum : uint8_t
     down_configRainAdaptiveConfig = 29,
     down_uploadRainPowerTiming = 31,
     down_configRainPowerTiming = 33,
+    down_keepOnlineThisWake = 35,
 
     preserved
     } e_pb_func;
@@ -86,6 +88,14 @@ typedef enum : uint8_t
     OTA_ACK_BAD_PARAM = 5,         /* 参数非法 */
     OTA_ACK_TOO_LARGE = 6,         /* 镜像过大 */
     } e_ota_ack_result;
+
+/** 功能码 34：本次唤醒保持在线状态；0xFF 表示功能码 35 参数非法。 */
+typedef enum : uint8_t
+    {
+    KEEP_ONLINE_THIS_WAKE_OFF = 0x00,
+    KEEP_ONLINE_THIS_WAKE_ON = 0x01,
+    KEEP_ONLINE_THIS_WAKE_FAILED = 0xFF,
+    } e_keep_online_this_wake_result;
 
 typedef enum : uint8_t
     {

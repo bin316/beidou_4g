@@ -102,6 +102,8 @@ private:
 
     void event_action_vibration(void);
     void event_action_message(void);
+    /** 从业务 TCP 字节流持续提取完整协议帧，兼容黏包和拆包。 */
+    void process_downlink_frame(uint8_t *message, size_t received_size);
     /** Timer 投递的服务器超时上报（工作线程执行） */
     void event_action_server_report(void);
     /** Timer 投递的在线超时休眠（工作线程执行） */
@@ -142,6 +144,8 @@ private:
     /** 雨量功能未编译时，用 v2.2 对应结果码明确返回“不支持”。 */
     void message_rain_feature_unsupported(e_pb_func response_func,
 	uint8_t unavailable_result);
+    /** 功能码 35：仅当前唤醒抑制自动休眠；0/1 成功回显，非法值以功能码 34 回 0xFF。 */
+    void message_keep_online_this_wake(uint8_t value);
     /** 服务器 OK：仅 awaiting_report_ok_ 时可能休眠（对齐 Inclination） */
     void message_heartbeat(void);
     void mark_report_pending_ack(void);
@@ -149,6 +153,16 @@ private:
 
     /** true=最近一次成功发出 up_report，下一条 OK 视为上报确认 */
     bool awaiting_report_ok_ = false;
+    /** 仅 RAM 有效；本次唤醒期间拦截 OK/超时触发的自动休眠。 */
+    bool keep_online_this_wake_ = false;
+
+    /** Timer 回调只置位；工作线程轮询并执行可能阻塞的上报/休眠。 */
+    volatile bool server_report_due_ = false;
+    volatile bool device_sleep_due_ = false;
+
+    static constexpr size_t kDownlinkFrameCapacity = 320u;
+    uint8_t downlink_frame_[kDownlinkFrameCapacity] = {};
+    size_t downlink_frame_len_ = 0u;
 
     /** 当前配置会话意图（RAM）；进 Standby/退出时清零，不落 NVM */
     uint8_t config_intent_ = 0;

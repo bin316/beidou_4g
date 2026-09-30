@@ -6,7 +6,114 @@ srst_only separate srst_nogate srst_open_drain connect_assert_srst
 Info : tcl server disabled
 Info : Listening on port 4444 for telnet connections
 Info : STLINK V2J47S7 (API v2) VID:PID 0483:3748
-Info : Target voltage: 0.000000
-Error: target voltage may be too low for reliable debugging
-Error: init mode failed (unable to connect to the target)
-
+Info : Target voltage: 2.360422
+Info : clock speed 4000 kHz
+Info : stlink_dap_op_connect(connect)
+Info : SWD DPIDR 0x2ba01477
+Info : [stm32l4.cpu] Cortex-M4 r0p1 processor detected
+Info : [stm32l4.cpu] target has 6 breakpoints, 4 watchpoints
+Info : [stm32l4.cpu] Examination succeed
+Info : gdb port disabled
+Info : accepting 'telnet' connection on tcp/4444
+Error: error during read: Bad file descriptor
+Info : dropped 'telnet' connection
+Info : [stm32l4.cpu] external reset detected
+Info : accepting 'telnet' connection on tcp/4444
+Info : rtt: Searching for control block 'SEGGER RTT'
+Info : rtt: Control block found at 0x2000a2fc
+Info : Listening on port 12345 for rtt connections
+Error: error during read: Bad file descriptor
+Info : dropped 'telnet' connection
+Info : accepting 'rtt' connection on tcp/12345
+Info : [stm32l4.cpu] external reset detected
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Warn : rtt: Up-channel 0 is not active
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 100ms
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: Failed to read memory and, additionally, failed to find out where
+Error: rtt: Failed to read up-channel 0 description
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 300ms
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 700ms
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 1500ms
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 3100ms
+Error: Fail reading CTRL/STAT register. Force reconnect
+Polling target stm32l4.cpu failed, trying to reexamine
+Error: Fail reading CTRL/STAT register. Force reconnect
+Error: [stm32l4.cpu] Examination failed
+Examination failed, GDB will be halted. Polling again in 6300ms

@@ -37,6 +37,7 @@ using namespace magic_enum;
 #include "functional"
 
 #include "Xuart.h"
+#include "stream_buffer.h"
 
 using namespace std;
 
@@ -73,7 +74,10 @@ public:
 	 */
 	bool connect(air780_server_t server = server_main, uint32_t timeout_ms = 0,
 		uint8_t attempts = 3u, uint32_t retry_interval_ms = 0u);
-	bool disconnect(air780_server_t server = server_main);
+	/**
+	 * @brief 关闭 TCP；force 用于清理本地状态尚未更新的迟到 CONNECT OK。
+	 */
+	bool disconnect(air780_server_t server = server_main, bool force = false);
 
 	/*
 	 * @brief sleep the module
@@ -212,8 +216,12 @@ private:
 
 	NVM *nvm = NULL;
 
-	MessageBufferHandle_t msgBuffer[3] = {
-	NULL, NULL, NULL };
+	/** 业务 TCP 是连续字节流：LTE_RX 写入、Solution 单线程连续组帧读取。 */
+	StreamBufferHandle_t msgBuffer[enum_count<air780_server_t>()] = {};
+	/** CONNECT OK/FAIL 或 +CIPSTART 终态，用于区分建连超时与已明确失败。 */
+	bool connectionTerminal[enum_count<air780_server_t>()] = {};
+	/** CIPCLOSE 后由 CIPSTATUS/CLOSED 确认的状态清理，防止旧 CONNECT OK 进入下一次重试。 */
+	bool connectionCloseObserved[enum_count<air780_server_t>()] = {};
 
 	int setAutoSleepTimeout(uint32_t time);
 

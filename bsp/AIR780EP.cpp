@@ -53,41 +53,38 @@ using namespace std;
 
 namespace {
 
+/* 协议最大帧不足 266B；留出连续下行突发的排队空间，且 RX 任务绝不等待消费者。 */
+constexpr size_t kBusinessRxStreamSize = 1024u;
+
 /** 解析 link2 +RECEIVE；兼容 :\\r\\n / :\\n（对齐 Slope） */
-bool agnss_parse_receive(string_view sv, int *data_len, const char **payload,
-	size_t *payload_avail)
+/** 解析任意链路 +RECEIVE 头；调用方保证 sv 由 NUL 结尾的暂存区构造。 */
+bool parse_receive_urc(string_view sv, int *link_num, int *data_len,
+	const char **payload, size_t *payload_avail)
     {
-    int link_num = -1;
-    const size_t hdr = sv.find("+RECEIVE");
-    if (hdr == string_view::npos || data_len == nullptr || payload == nullptr
-	    || payload_avail == nullptr)
+    if (link_num == nullptr || data_len == nullptr || payload == nullptr
+	    || payload_avail == nullptr
+	    || sscanf(sv.data(), "+RECEIVE,%d,%d:", link_num, data_len) < 2
+	    || *link_num < 0 || *link_num >= 3 || *data_len <= 0)
 	{
 	return false;
 	}
-    if (sscanf(sv.data() + hdr, "+RECEIVE,%d,%d:", &link_num, data_len) < 2)
-	{
-	return false;
-	}
-    if (link_num != (int) AIR780EP::server_debug || *data_len <= 0)
-	{
-	return false;
-	}
-    const size_t colon = sv.find(':', hdr);
+    const size_t colon = sv.find(':');
     if (colon == string_view::npos)
 	{
 	return false;
 	}
-    size_t off = colon + 1;
-    if (off + 1 < sv.size() && sv[off] == '\r' && sv[off + 1] == '\n')
+    size_t offset = colon + 1u;
+    if (offset + 1u < sv.size() && sv[offset] == '\r'
+	    && sv[offset + 1u] == '\n')
 	{
-	off += 2;
+	offset += 2u;
 	}
-    else if (off < sv.size() && sv[off] == '\n')
+    else if (offset < sv.size() && sv[offset] == '\n')
 	{
-	off += 1;
+	++offset;
 	}
-    *payload = sv.data() + off;
-    *payload_avail = (sv.size() > off) ? (sv.size() - off) : 0U;
+    *payload = sv.data() + offset;
+    *payload_avail = sv.size() - offset;
     return true;
     }
 
@@ -168,9 +165,18 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
 
     bool ok = false;
 
+    /* 先建接收流；CONNECT OK 后服务器可立即下发，不能等确认后才创建。 */
+    if (server != server_debug
+	    && msgBuffer[enum_integer<air780_server_t>(server)] == NULL)
+	{
+	msgBuffer[enum_integer<air780_server_t>(server)] = xStreamBufferCreate(
+		kBusinessRxStreamSize, 1u);
+	configASSERT(msgBuffer[enum_integer<air780_server_t>(server)] != NULL);
+	}
+
     if (server == server_debug && timeout_ms > 0)
 	{
-	/* AGNSS link2 短连：调用方超时控制，不建 MessageBuffer */
+	/* AGNSS link2 短连：调用方超时控制，不建业务接收流。 */
 	sendCmd(100, rx_content_t::CIPSTART,
 		"AT+CIPSTART=%d,\"TCP\",\"%d.%d.%d.%d\",%d\r\n", (int) server,
 		(int) params.server[server].ip[0],
@@ -203,6 +209,8 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
 		(timeout_ms == 0u) ? 2000u : timeout_ms;
 	for (uint8_t try_index = 0; try_index < try_times; ++try_index)
 	    {
+	    connectionsStatus[enum_integer<air780_server_t>(server)] = false;
+	    connectionTerminal[enum_integer<air780_server_t>(server)] = false;
 	    sendCmd(100, rx_content_t::CIPSTART,
 		    "AT+CIPSTART=%d,\"TCP\",\"%d.%d.%d.%d\",%d\r\n",
 		    (int) server, (int) params.server[server].ip[0],
@@ -213,15 +221,23 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
 	    sendCmd(100, rx_content_t::CIPSTATUS, "AT+CIPSTATUS\r\n");
 	    if (testif([this, server]()
 		{
-		return connectionsStatus[enum_integer<air780_server_t>(server)];
-		}, true, attempt_timeout_ms))
+		const size_t index = enum_integer<air780_server_t>(server);
+		return connectionTerminal[index] || connectionsStatus[index];
+		}, true, attempt_timeout_ms)
+		&& connectionsStatus[enum_integer<air780_server_t>(server)])
 		{
 		break;
 		}
-	    /* 下一次 CIPSTART 前清理模组链路状态，避免沿用半开连接。 */
+	    /* 超时后仍可能迟到 CONNECT OK：下一次 CIPSTART 前先关闭并等状态回落。 */
+	    connectionCloseObserved[enum_integer<air780_server_t>(server)] = false;
 	    sendCmd(100, rx_content_t::CIPCLOSE, "AT+CIPCLOSE=%d\r\n",
 		    enum_integer<air780_server_t>(server));
 	    sendCmd(100, rx_content_t::CIPSTATUS, "AT+CIPSTATUS\r\n");
+	    (void) testif([this, server]()
+		{
+		const size_t index = enum_integer<air780_server_t>(server);
+		return connectionCloseObserved[index] && !connectionsStatus[index];
+		}, true, 500);
 	    connectionsStatus[enum_integer<air780_server_t>(server)] = false;
 	    util_lowpower_iwdg_feed();
 	    if (try_index + 1u < try_times && retry_interval_ms > 0u)
@@ -233,15 +249,6 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
 	ok = connectionsStatus[enum_integer<air780_server_t>(server)];
 	}
 
-    if (ok && server != server_debug
-	    && msgBuffer[enum_integer<air780_server_t>(server)] == NULL)
-	{
-	msgBuffer[enum_integer<air780_server_t>(server)] = xMessageBufferCreate(
-		256);
-	configASSERT(
-		msgBuffer[enum_integer<air780_server_t>(server)] != NULL);
-	}
-
     if (ok)
 	{
 	logInfo("4G: link%d TCP已连接", (int) server);
@@ -251,11 +258,11 @@ bool AIR780EP::connect(air780_server_t server, uint32_t timeout_ms,
     return ok;
     }
 
-bool AIR780EP::disconnect(air780_server_t server)
+bool AIR780EP::disconnect(air780_server_t server, bool force)
     {
     xSemaphoreTake(at_mutex_, portMAX_DELAY);
     configASSERT(enum_contains<air780_server_t>(server));
-    if (!connectionsStatus[enum_integer<air780_server_t>(server)])
+    if (!connectionsStatus[enum_integer<air780_server_t>(server)] && !force)
 	{
 	xSemaphoreGive(at_mutex_);
 	return true;
@@ -274,10 +281,12 @@ bool AIR780EP::disconnect(air780_server_t server)
 	connectionsStatus[enum_integer<air780_server_t>(server)] = false;
 	}
 
-    if (msgBuffer[enum_integer<air780_server_t>(server)] != NULL)
+    /* RX 与 Solution 分属两个任务，断链不删除句柄以免 read() 与 delete 并发。
+     * 下一次会话复用同一流并清掉旧端点残留字节。 */
+    if (server != server_debug
+	    && msgBuffer[enum_integer<air780_server_t>(server)] != NULL)
 	{
-	vMessageBufferDelete(msgBuffer[enum_integer<air780_server_t>(server)]);
-	msgBuffer[enum_integer<air780_server_t>(server)] = NULL;
+	xStreamBufferReset(msgBuffer[enum_integer<air780_server_t>(server)]);
 	}
 
     xSemaphoreGive(at_mutex_);
@@ -322,12 +331,11 @@ void AIR780EP::reset()
 int AIR780EP::read(char *buffer, uint16_t len, uint32_t timeout,
 	air780_server_t server)
     {
-    /*return -1 if server not connected*/
-    if (!connectionsStatus[enum_integer<air780_server_t>(server)])
+    /* CLOSED 可与已入队的下行相邻；断链后仍允许 Solution 取完现有字节。 */
+    if (msgBuffer[enum_integer<air780_server_t>(server)] == NULL)
 	return -1;
-    /*read from message buffer*/
-    /*$notice only one thread could read the buffer at one time*/
-    return (int) xMessageBufferReceive(
+    /* 业务 TCP 本质是字节流；Solution 负责跨 read() 的完整帧组装。 */
+    return (int) xStreamBufferReceive(
 	    msgBuffer[enum_integer<air780_server_t>(server)], buffer, len,
 	    timeout);
     }
@@ -510,6 +518,9 @@ void AIR780EP::rxThread(void *argument)
     constexpr size_t kRxFrameCap = 1536;
     char *buffer = (char*) pvPortMalloc(kRxFrameCap);
     configASSERT(buffer != NULL);
+    /* +RECEIVE 的头和载荷都可能跨 UART 批次；静态区避免挤占 RX 任务栈。 */
+    static char receive_staging[kRxFrameCap * 2u + 1u] = {};
+    size_t receive_staging_len = 0u;
     string_view sv(buffer, kRxFrameCap);
     auto clear = [buffer]()
 	{
@@ -747,9 +758,14 @@ void AIR780EP::rxThread(void *argument)
 			endPos = sv.size();
 			}
 		    string_view connectionState = sv.substr(pos, endPos - pos);
-		    pthis->connectionsStatus[i] =
-			    connectionState.find("CONNECTED")
-				    != string_view::npos;
+	    pthis->connectionsStatus[i] =
+		    connectionState.find("CONNECTED")
+			    != string_view::npos;
+	    if (connectionState.find("CLOSED") != string_view::npos
+		    || connectionState.find("INITIAL") != string_view::npos)
+		{
+		pthis->connectionCloseObserved[i] = true;
+		}
 		    }
 		}
 	    }
@@ -767,16 +783,24 @@ void AIR780EP::rxThread(void *argument)
     for (uint8_t i = 0; i < 3; i++)
 	{
 	char ok_pat[20];
+	char ok_compact_pat[20];
 	char fail_pat[24];
+	char fail_compact_pat[24];
 	snprintf(ok_pat, sizeof(ok_pat), "%u, CONNECT OK", i);
+	snprintf(ok_compact_pat, sizeof(ok_compact_pat), "%u,CONNECT OK", i);
 	snprintf(fail_pat, sizeof(fail_pat), "%u, CONNECT FAIL", i);
-	if (sv.find(ok_pat) != string_view::npos)
+	snprintf(fail_compact_pat, sizeof(fail_compact_pat), "%u,CONNECT FAIL", i);
+	if (sv.find(ok_pat) != string_view::npos
+		|| sv.find(ok_compact_pat) != string_view::npos)
 	    {
 	    pthis->connectionsStatus[i] = true;
+	    pthis->connectionTerminal[i] = true;
 	    }
-	if (sv.find(fail_pat) != string_view::npos)
+	if (sv.find(fail_pat) != string_view::npos
+		|| sv.find(fail_compact_pat) != string_view::npos)
 	    {
 	    pthis->connectionsStatus[i] = false;
+	    pthis->connectionTerminal[i] = true;
 	    }
 	}
     if (sv.find("+CIPSTART:") != string_view::npos)
@@ -788,51 +812,120 @@ void AIR780EP::rxThread(void *argument)
 	if (linkNum >= 0 && linkNum <= 2)
 	    {
 	    pthis->connectionsStatus[linkNum] = (result == 0);
+	    pthis->connectionTerminal[linkNum] = true;
 	    }
 	}
 
-    if (sv.find("+RECEIVE") != string_view::npos)
+
+    bool saw_receive = false;
+    if (rx_len > sizeof(receive_staging) - 1u - receive_staging_len)
 	{
-	int linkNum = 0xff;
-	int len = 0;
-	const size_t recv_pos = sv.find("+RECEIVE");
-	if (sscanf(sv.data() + recv_pos, "+RECEIVE,%d,%d:", &linkNum, &len)
-		>= 2 && linkNum >= 0 && linkNum <= 2 && len > 0)
+	logWarning("4G_RX: 接收暂存区溢出，丢弃未完成 +RECEIVE");
+	receive_staging_len = 0u;
+	}
+    memcpy(receive_staging + receive_staging_len, sv.data(), rx_len);
+    receive_staging_len += rx_len;
+    receive_staging[receive_staging_len] = '\0';
+
+    while (receive_staging_len > 0u)
+	{
+	string_view receive_view(receive_staging, receive_staging_len);
+	const size_t recv_pos = receive_view.find("+RECEIVE");
+	if (recv_pos == string_view::npos)
 	    {
-	    if (linkNum == (int) AIR780EP::server_debug
-		    && util_agnss_rx_is_active())
+	    /* 仅留下可能构成下一批 +RECEIVE 前缀的尾巴。 */
+	    const size_t keep = (receive_staging_len < sizeof("+RECEIVE") - 1u) ?
+		    receive_staging_len : sizeof("+RECEIVE") - 2u;
+	    if (keep > 0u)
 		{
-		const char *payload = nullptr;
-		size_t payload_avail = 0;
-		if (agnss_parse_receive(sv, &len, &payload, &payload_avail))
-		    {
-		    const size_t copy_len =
-			    ((size_t) len < payload_avail) ?
-				    (size_t) len : payload_avail;
-		    if (copy_len > 0)
-			{
-			util_agnss_rx_append(payload, copy_len);
-			}
-		    util_agnss_rx_set_pending(len - (int) copy_len);
-		    }
+		memmove(receive_staging,
+			receive_staging + receive_staging_len - keep, keep);
 		}
-	    else if (pthis->msgBuffer[linkNum] != NULL)
+	    receive_staging_len = keep;
+	    receive_staging[receive_staging_len] = '\0';
+	    break;
+	    }
+	saw_receive = true;
+	if (recv_pos > 0u)
+	    {
+	    memmove(receive_staging, receive_staging + recv_pos,
+		    receive_staging_len - recv_pos);
+	    receive_staging_len -= recv_pos;
+	    receive_staging[receive_staging_len] = '\0';
+	    continue;
+	    }
+
+	int linkNum = -1;
+	int len = 0;
+	const char *payload = nullptr;
+	size_t payload_avail = 0u;
+	if (!parse_receive_urc(receive_view, &linkNum, &len, &payload,
+		&payload_avail))
+	    {
+	    /* 头不完整时等待下一批；格式损坏才丢 1 字节重新同步。 */
+	    if (receive_view.find(':') == string_view::npos)
 		{
-		const size_t hdr = sv.find(":\r\n");
-		const char *payload =
-			(hdr != string_view::npos) ? (&sv[hdr] + 3) : nullptr;
-		if (payload != nullptr)
-		    {
-		    xMessageBufferSend(pthis->msgBuffer[linkNum], payload, len,
-			    portMAX_DELAY);
-		    util_events_generate(util_event_code_t::message);
-		    }
+		break;
+		}
+	    memmove(receive_staging, receive_staging + 1u,
+		    receive_staging_len - 1u);
+	    --receive_staging_len;
+	    receive_staging[receive_staging_len] = '\0';
+	    continue;
+	    }
+
+	const size_t declared_len = static_cast<size_t>(len);
+	if (linkNum == static_cast<int>(AIR780EP::server_debug)
+		&& util_agnss_rx_is_active())
+	    {
+	    const size_t copy_len = (payload_avail < declared_len) ?
+		    payload_avail : declared_len;
+	    if (copy_len > 0u)
+		{
+		util_agnss_rx_append(payload, copy_len);
+		}
+	    util_agnss_rx_set_pending(len - static_cast<int>(copy_len));
+	    const size_t consumed = static_cast<size_t>(payload - receive_staging)
+		    + copy_len;
+	    memmove(receive_staging, receive_staging + consumed,
+		    receive_staging_len - consumed);
+	    receive_staging_len -= consumed;
+	    receive_staging[receive_staging_len] = '\0';
+	    continue;
+	    }
+	if (payload_avail < declared_len)
+	    {
+	    break;
+	    }
+	if (pthis->msgBuffer[linkNum] != NULL)
+	    {
+	    const size_t space = xStreamBufferSpacesAvailable(
+		    pthis->msgBuffer[linkNum]);
+	    if (space < declared_len)
+		{
+		logWarning("4G_RX: link%d 业务流不足，丢弃 %u 字节", linkNum,
+			(unsigned) declared_len);
+		}
+	    else if (xStreamBufferSend(pthis->msgBuffer[linkNum], payload,
+		    declared_len, 0u) == declared_len)
+		{
+		/* 事件仅唤醒 Solution；队列满时字节仍留在 StreamBuffer 等轮询。 */
+		(void) util_events_generate_noblock(util_event_code_t::message);
+		}
+	    else
+		{
+		logWarning("4G_RX: link%d 业务流写入失败", linkNum);
 		}
 	    }
+	const size_t consumed = static_cast<size_t>(payload - receive_staging)
+	    + declared_len;
+	memmove(receive_staging, receive_staging + consumed,
+	    receive_staging_len - consumed);
+	receive_staging_len -= consumed;
+	receive_staging[receive_staging_len] = '\0';
 	}
-    else if (util_agnss_rx_is_active() && util_agnss_rx_pending() > 0
-	    && sv.find("+RECEIVE") == string_view::npos
-	    && sv.find("AT+") == string_view::npos)
+    if (util_agnss_rx_is_active() && util_agnss_rx_pending() > 0
+	    && !saw_receive && sv.find("AT+") == string_view::npos)
 	{
 	/* AGNSS 二进制续传帧（无 URC 头） */
 	util_agnss_rx_append_continuation(sv.data(), sv.size());
@@ -851,11 +944,8 @@ void AIR780EP::rxThread(void *argument)
 	    if (linkNum <= 2 && linkNum >= 0)
 		{
 		pthis->connectionsStatus[linkNum] = false;
-		if (pthis->msgBuffer[linkNum] != NULL)
-		    {
-		    vMessageBufferDelete(pthis->msgBuffer[linkNum]);
-		    pthis->msgBuffer[linkNum] = NULL;
-		    }
+		pthis->connectionCloseObserved[linkNum] = true;
+		/* 接收流在 AIR780EP 生命周期内保持，避免与 Solution::read 并发 delete。 */
 		}
 	    }
 	}

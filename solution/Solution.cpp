@@ -824,12 +824,108 @@ void Solution::event_action_vibration(void)
  */
 void Solution::event_action_message(void)
     {
-    // AI生成注释: 分配64字节内存用于存储接收到的消息
-    uint8_t *message = (uint8_t*) pvPortMalloc(64);
-    // AI生成注释: 实际读取到的数据长度
-    uint16_t read_size = 0;
-    // AI生成注释: 目标CRC校验值
+    uint8_t chunk[128];
+    int read_size = 0;
+
+    /* StreamBuffer 不保留消息边界：每次尽量排空，再从应用协议前缀连续组帧。 */
+    while ((read_size = read_message(chunk, sizeof(chunk))) > 0)
+	{
+	if (downlink_frame_len_ + static_cast<size_t>(read_size)
+		> kDownlinkFrameCapacity)
+	    {
+	    logWarning("消息: 连续组帧缓冲溢出，丢弃未完成帧");
+	    downlink_frame_len_ = 0u;
+	    }
+	memcpy(downlink_frame_ + downlink_frame_len_, chunk,
+		static_cast<size_t>(read_size));
+	downlink_frame_len_ += static_cast<size_t>(read_size);
+
+	while (downlink_frame_len_ >= 3u)
+	    {
+	    size_t prefix = 0u;
+	    while (prefix + 2u < downlink_frame_len_
+		&& !(downlink_frame_[prefix] == 0xFBu
+		    && downlink_frame_[prefix + 1u] == 0xFBu
+		    && downlink_frame_[prefix + 2u] == 0xFBu))
+		{
+		++prefix;
+		}
+	    if (prefix + 2u >= downlink_frame_len_)
+		{
+		/* 仅保留可能组成下一个 FB FB FB 的尾部。 */
+		const size_t keep = (downlink_frame_len_ >= 2u) ? 2u :
+			downlink_frame_len_;
+		memmove(downlink_frame_, downlink_frame_ + downlink_frame_len_ - keep,
+			keep);
+		downlink_frame_len_ = keep;
+		break;
+		}
+	    if (prefix > 0u)
+		{
+		memmove(downlink_frame_, downlink_frame_ + prefix,
+			downlink_frame_len_ - prefix);
+		downlink_frame_len_ -= prefix;
+		}
+	    if (downlink_frame_len_ < 3u + sizeof(pb_header) + sizeof(uint16_t))
+		{
+		break;
+		}
+
+	    const bool heartbeat = downlink_frame_[7] == 'O'
+		&& downlink_frame_[8] == 'K';
+	    const size_t frame_len = heartbeat ? 11u :
+		3u + sizeof(pb_header) + downlink_frame_[8]
+			+ sizeof(uint16_t);
+	    if (downlink_frame_len_ < frame_len)
+		{
+		break;
+		}
+	    process_downlink_frame(downlink_frame_, frame_len);
+	    memmove(downlink_frame_, downlink_frame_ + frame_len,
+		downlink_frame_len_ - frame_len);
+	    downlink_frame_len_ -= frame_len;
+	    }
+	}
+    }
+
+/** 仅允许协议已定义的固定 dataLen 进入结构体分发路径。 */
+static bool downlink_payload_length_valid(uint8_t function, uint8_t data_len)
+    {
+    switch (function)
+	{
+	case e_pb_func::down_uploadReport:
+	case e_pb_func::down_uploadRunningConfig:
+	case e_pb_func::down_sleep:
+	case e_pb_func::down_uploadSystemConfig:
+	case e_pb_func::down_uploadFirmwareVersion:
+	case e_pb_func::down_uploadLocateSwitch:
+	case e_pb_func::down_uploadRainAdaptiveConfig:
+	case e_pb_func::down_uploadRainPowerTiming:
+	    return data_len == 0u;
+	case e_pb_func::down_configRunning:
+	    return data_len == sizeof(pb_runningConfig);
+	case e_pb_func::down_configMode:
+	    return data_len == sizeof(pb_configModeReq);
+	case e_pb_func::down_configSystem:
+	    return data_len == sizeof(pb_systemConfig);
+	case e_pb_func::down_configWorkMode:
+	    return data_len == sizeof(solution_mode_e);
+	case e_pb_func::down_configLocateGeo:
+	    return data_len == sizeof(pb_locateGeo);
+	case e_pb_func::down_configLocateSwitch:
+	case e_pb_func::down_keepOnlineThisWake:
+	    return data_len == sizeof(uint8_t);
+	case e_pb_func::down_otaRequest:
+	    return data_len == sizeof(pb_otaRequest);
+	default:
+	    return false;
+	}
+    }
+
+void Solution::process_downlink_frame(uint8_t *message, size_t read_size)
+    {
     uint16_t target_crc = 0;
+    // AI生成注释: 目标CRC校验值
     // AI生成注释: CRC数据指针
     uint8_t *crc_ptr = NULL;
     // AI生成注释: 协议数据指针，用于遍历消息内容
@@ -839,13 +935,8 @@ void Solution::event_action_message(void)
     // AI生成注释: 参数数据指针
     void *param_ptr = NULL;
 
-    // AI生成注释: 确保内存分配成功，否则触发断言
-    configASSERT(message != nullptr);
-
-    // AI生成注释: 从通信模块读取消息，最大64字节
-    read_size = read_message(message, 64);
-    /* 先打原始长度与 hex（含 11B 短应答），再走心跳/协议解析 */
-    log_rx_raw(message, read_size);
+    /* 每次仅传入一条已完整组装的帧；此处再做 CRC 和长度防御。 */
+    log_rx_raw(message, static_cast<uint16_t>(read_size));
 
     // AI生成注释: 检查是否包含心跳包标识 "OK"（无功能码格式：FBFBFB + code + OK + CRC）
 	if (read_size >= 11)
@@ -878,7 +969,6 @@ void Solution::event_action_message(void)
 				{
 				logInfo("确认收到OK回复");
 				this->message_heartbeat();
-				vPortFree(message);
 				return;
 				}
 			}
@@ -891,8 +981,6 @@ void Solution::event_action_message(void)
     // AI生成注释: 检查读取的数据是否足够包含协议头部
     if (read_size < sizeof(pb_header))
 	{
-	// AI生成注释: 数据不足，释放内存并返回
-	vPortFree(message);
 	return;
 	}
 
@@ -912,6 +1000,13 @@ void Solution::event_action_message(void)
 	    // AI生成注释: 验证设备编码是否匹配
 	    if (possible_header->code == this->rt_solution.systemConfig.code)
 		{
+		/* 即使上层组帧有误，也绝不能按 dataLen 越界取 CRC。 */
+		if (protocol_ptr + sizeof(pb_header) + possible_header->dataLen
+			+ sizeof(uint16_t) > message + read_size)
+		    {
+		    logWarning("消息: 声明长度超过完整帧");
+		    return;
+		    }
 		// AI生成注释: 计算CRC校验数据的位置
 		crc_ptr = protocol_ptr + sizeof(pb_header)
 			+ possible_header->dataLen;
@@ -925,6 +1020,14 @@ void Solution::event_action_message(void)
 		    // AI生成注释: CRC校验通过，计算参数数据的位置
 		    param_ptr = ((uint8_t*) possible_header)
 			    + sizeof(pb_header);
+		    if (!downlink_payload_length_valid(possible_header->function,
+			    possible_header->dataLen))
+			{
+			logWarning("消息: 功能码=%u 载荷长度=%u 不匹配，拒绝分发",
+				(unsigned) possible_header->function,
+				(unsigned) possible_header->dataLen);
+			return;
+			}
 		    // AI生成注释: 记录消息确认日志
 		    logInfo("消息: 已确认");
 		    /* 仅刷新上报超时；设备休眠为唤醒后硬计时，收包不续命 */
@@ -953,10 +1056,11 @@ void Solution::event_action_message(void)
 			this->message_change_run_parameters(
 				(pb_runningConfig*) param_ptr);
 			break;
-		    // AI生成注释: 服务器请求设备休眠
-		    case e_pb_func::down_sleep:
-			this->message_sleep();
-			break;
+	    // AI生成注释: 服务器请求设备休眠
+	    case e_pb_func::down_sleep:
+		/* 功能码 7 是显式 Standby 命令，不受本次唤醒保持在线开关影响。 */
+		this->message_sleep();
+		break;
 		    // AI生成注释: 服务器请求进入配置模式
 		    case e_pb_func::down_configMode:
 			if (possible_header->dataLen == sizeof(pb_configModeReq))
@@ -1029,9 +1133,11 @@ void Solution::event_action_message(void)
 		this->message_rain_feature_unsupported(
 			e_pb_func::up_rainPowerTimingResult, 0x05u);
 		break;
+	    case e_pb_func::down_keepOnlineThisWake:
+		this->message_keep_online_this_wake(
+			*(const uint8_t*) param_ptr);
+		break;
 		}
-		    // AI生成注释: 消息处理完成，释放内存并返回
-		    vPortFree(message);
 		    return;
 		    }
 		}
@@ -1039,8 +1145,6 @@ void Solution::event_action_message(void)
 	// AI生成注释: 继续搜索下一个可能的协议起始位置
 	protocol_ptr++;
 	}
-    // AI生成注释: 未找到有效消息，释放内存
-    vPortFree(message);
     // AI生成注释: 记录无效消息警告日志
     logWarning("消息: 格式错误");
     return;
@@ -1531,6 +1635,42 @@ void Solution::message_rain_feature_unsupported(e_pb_func response_func,
 	(unsigned) response_func, (unsigned) unavailable_result);
     }
 
+/** 功能码 35 不落盘：35=0 重启当前自动休眠定时器（t3/t6），不会立即休眠。 */
+void Solution::message_keep_online_this_wake(uint8_t value)
+    {
+    const bool valid = value == KEEP_ONLINE_THIS_WAKE_OFF
+	    || value == KEEP_ONLINE_THIS_WAKE_ON;
+    if (valid)
+	{
+	keep_online_this_wake_ = value == KEEP_ONLINE_THIS_WAKE_ON;
+	device_sleep_due_ = false;
+	if (!keep_online_this_wake_ && device_timeout_timer != nullptr)
+	    {
+	    /* 保证功能码 34 应答有发送窗口，并恢复当前 t3/t6 自动休眠周期。 */
+	    xTimerReset(device_timeout_timer, portMAX_DELAY);
+	    }
+	}
+    else
+	{
+	logWarning("保持在线: 非法参数=%u，返回失败码 0xFF，当前状态=%u", (unsigned) value,
+		(unsigned) keep_online_this_wake_);
+	}
+
+    pb_packCmdletOrResponse rsps;
+    rsps.body.header.code = this->rt_solution.systemConfig.code;
+    rsps.body.header.function = e_pb_func::up_keepOnlineThisWake;
+    rsps.body.header.dataLen = sizeof(rsps.body.cmdletOrResponse);
+    rsps.body.cmdletOrResponse = valid ?
+	    (keep_online_this_wake_ ? KEEP_ONLINE_THIS_WAKE_ON :
+		KEEP_ONLINE_THIS_WAKE_OFF) : KEEP_ONLINE_THIS_WAKE_FAILED;
+    rsps.body.crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) (&rsps.body),
+	    CFL(rsps.body));
+    send_message((uint8_t*) &rsps, sizeof(pb_packCmdletOrResponse));
+    logInfo("保持在线: 本次唤醒=%u, 应答=0x%02X",
+	(unsigned) keep_online_this_wake_,
+	(unsigned) rsps.body.cmdletOrResponse);
+    }
+
 /* LBS 会话状态（对齐 Slope sys_gnss：事件循环执行，不堵在 start_locate） */
 static volatile bool s_lbs_due = false;
 static bool s_lbs_active = false;
@@ -1941,6 +2081,13 @@ void Solution::message_heartbeat(void)
 	return;
 	}
 
+    if (keep_online_this_wake_)
+	{
+	clear_report_pending_ack();
+	logInfo("本次唤醒保持在线，忽略 up_report OK 自动休眠");
+	return;
+	}
+
     awaiting_report_ok_ = false;
 
     /* 北斗仍上电：视为搜星会话，对齐 Inclination t3 会话不因 OK 进睡 */
@@ -2018,13 +2165,17 @@ int Solution::read_message(void *dest, uint16_t len)
 void Solution::server_timeout_timer_callback(TimerHandle_t xTimer)
     {
     auto *pthis = (Solution*) pvTimerGetTimerID(xTimer);
-    /* 只投递事件：report 含 AT/日志，放 Timer 任务会栈溢出且堵住喂狗定时器 */
+    /* 只置位：report 含 AT/日志，必须由 Solution 工作线程执行。 */
     if (util_agnss_rx_is_active()
 	    || (pthis != nullptr && pthis->endpoint_switch_in_progress_))
 	{
 	return;
 	}
-    util_events_generate(util_event_code_t::server_report_due);
+    if (pthis != nullptr)
+	{
+	/* Timer 服务任务不可等待事件队列；工作线程在下一轮消费该标志。 */
+	pthis->server_report_due_ = true;
+	}
     }
 
 /**
@@ -2040,8 +2191,10 @@ void Solution::device_timeout_timer_callback(TimerHandle_t xTimer)
 	xTimerStart(xTimer, 0);
 	return;
 	}
-    (void) pthis;
-    util_events_generate(util_event_code_t::device_sleep_due);
+    if (pthis != nullptr)
+	{
+	pthis->device_sleep_due_ = true;
+	}
     }
 
 /** 工作线程执行：服务器超时上报 */
@@ -2057,6 +2210,11 @@ void Solution::event_action_server_report(void)
 /** 工作线程执行：在线超时进休眠 */
 void Solution::event_action_device_sleep(void)
     {
+    if (keep_online_this_wake_)
+	{
+	logInfo("本次唤醒保持在线，忽略在线超时自动休眠");
+	return;
+	}
     if (util_agnss_rx_is_active() || endpoint_switch_in_progress_)
 	{
 	return;
@@ -2095,6 +2253,20 @@ void Solution::event_process(void)
      *         这两个定时器应该在连接之后创建
      *
      * */
+    /* 即使消息唤醒事件在队列满时丢失，业务字节仍在 StreamBuffer 中。 */
+    this->event_action_message();
+
+    if (server_report_due_)
+	{
+	server_report_due_ = false;
+	this->event_action_server_report();
+	}
+    if (device_sleep_due_)
+	{
+	device_sleep_due_ = false;
+	this->event_action_device_sleep();
+	}
+
     // AI生成注释: 轮询系统事件，如果有事件发生则进行处理
     if (util_events_poll(&polled_event))
 	{
@@ -2107,13 +2279,13 @@ void Solution::event_process(void)
 	    break;
 	// AI生成注释: 消息事件 - 从服务器接收到消息
 	case util_event_code_t::message:
-	    this->event_action_message();
+	    /* 本轮开始已排空 StreamBuffer；保留分支兼容已有事件代码。 */
 	    break;
 	case util_event_code_t::server_report_due:
-	    this->event_action_server_report();
+	    this->server_report_due_ = true;
 	    break;
 	case util_event_code_t::device_sleep_due:
-	    this->event_action_device_sleep();
+	    this->device_sleep_due_ = true;
 	    break;
 	case util_event_code_t::gnss_pwr_off_commit:
 	    /* t4 延时关电后：滤波已跑完，刷坐标进 Flash */
@@ -2241,17 +2413,22 @@ void Solution::timers_create(void)
 			    1000
 				    * this->rt_solution.runningConfig.t2_serverRsps_timeout_sec),
 		    pdTRUE, (void*) this, server_timeout_timer_callback);
-    /* 唤醒后硬计时一次，到期必睡；pdFALSE=单次，收包不 reset */
+	/* RTC 例行唤醒且未搜星时用 t6；其余会话按 t3 硬计时。 */
+	const bool rtc_routine_wake =
+		util_lowpower_get_wake_source() == util_lowpower_wake_source_e::rtc
+		&& HAL_GPIO_ReadPin(BD_PWR_GPIO_Port, BD_PWR_Pin) == GPIO_PIN_RESET;
+	const uint32_t sleep_timeout_sec = rtc_routine_wake ?
+		this->rt_solution.runningConfig.t6_rtcEvent_sleep_sec :
+		this->rt_solution.runningConfig.t3_gnssSearch_sleep_sec;
+	/* 唤醒后硬计时一次，到期自动休眠；pdFALSE=单次，收包不 reset。 */
     this->device_timeout_timer = xTimerCreate(this->device_timeout_timer_name,
-	    pdMS_TO_TICKS(
-		    this->rt_solution.runningConfig.t3_gnssSearch_sleep_sec
-			    * 1000),
+	    pdMS_TO_TICKS(sleep_timeout_sec * 1000u),
 	    pdFALSE, (void*) this, device_timeout_timer_callback);
     // AI生成注释: 记录服务器响应超时倒计时时间
     logInfo("定时器: 服务器响应超时倒计时 %d秒",
 	    this->rt_solution.runningConfig.t2_serverRsps_timeout_sec);
-    logInfo("定时器: 设备硬休眠倒计时 %d秒(收包不续期)",
-	    this->rt_solution.runningConfig.t3_gnssSearch_sleep_sec);
+    logInfo("定时器: 设备硬休眠倒计时 %lu秒(%s，收包不续期)",
+	    (unsigned long) sleep_timeout_sec, rtc_routine_wake ? "t6" : "t3");
     // AI生成注释: 启动服务器响应超时定时器
     xTimerStart(this->server_timeout_timer, portMAX_DELAY);
     // AI生成注释: 启动设备活动超时定时器

@@ -219,7 +219,8 @@ void util_lowpower_standby(void) {
 	__flash_sync();
 	//	等待其余设备执行完成
 
-	vTaskDelay(pdMS_TO_TICKS(50));
+	/* 任何等待都必须在 critical 前完成，critical 内只保留待机寄存器配置。 */
+	vTaskDelay(pdMS_TO_TICKS(LOWPOWER_STANDBY_DELAY));
 
 	taskENTER_CRITICAL();
 //	进入关键区后，所有依赖freertos的组件都将失效（包括调试串口）
